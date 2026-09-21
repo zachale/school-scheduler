@@ -106,6 +106,37 @@ ENVS*2210 penalises clustering posts into the final 24 hours.
 - Max 7 core hours and 9.5 total hours in a day; exam days max 4 hours, no evenings
 - Oct 5–10 written off (away)
 
+## Getting the plan onto a real calendar (options, not built yet)
+
+Researched 2026-09-21. Nothing here touches Google Calendar yet.
+
+| Option | Update lag after a reflow | Setup | What it touches |
+|---|---|---|---|
+| 1. API sync into a dedicated "F26 Plan" calendar | seconds | Google Cloud project + OAuth desktop client, once (~15 min) | Creates one secondary calendar. Scope `calendar.app.created` can only see calendars the script created, so the primary calendar is out of reach. |
+| 2. ICS feed at a secret gist URL, subscribed "From URL" | 12-24 h in Google Calendar, no manual refresh; ~1 h in Apple Calendar | `gh gist create` | Nothing in Google, but anyone holding the URL can read the plan. |
+| 3. One-off `.ics` import | never (static) | none | Imports events; every reflow needs delete + re-import. |
+
+Option 1 is the one that fits this planner: reflows happen on the day something comes up, and a
+12-24 h lag means the calendar shows the old plan exactly when it matters.
+
+Gotchas for option 1:
+
+- An OAuth client whose consent screen is External + Testing gets refresh tokens that die after
+  7 days. A personal Gmail account cannot choose Internal, so set the publishing status to
+  "In production" (one "unverified app" warning at consent, then the token persists).
+- Key every synced event on a stable id (task id + session index) so a re-sync updates or deletes
+  events instead of duplicating them.
+
+The planner has no record of work actually done. `--from DATE` reschedules every task's full
+minutes from that date, so a live calendar drifts from reality after the first skipped block. A
+progress log (minutes done per task, subtracted before scheduling) is a prerequisite for
+maintaining any real calendar mid-term.
+
+Sources: [Calendar API scopes](https://developers.google.com/workspace/calendar/api/auth),
+[Calendars: insert](https://developers.google.com/workspace/calendar/api/v3/reference/calendars/insert),
+[ICS refresh rates](https://calfeed.ai/learn/ics-refresh-rate-apple-google),
+[7-day testing tokens](https://dev.to/ko-hi/googles-oauth-testing-mode-expires-refresh-tokens-in-7-days-publish-the-consent-screen-before-24hm).
+
 ## Current state
 
 394.8 h across 77 working days with Oct 5–10 written off and **hand-ins finishing 3 days
