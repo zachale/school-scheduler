@@ -7,6 +7,7 @@ constraint and re-running reflows everything predictably.
 ```bash
 uv run plan.py                  # replan + render
 uv run verify.py                # check the result against every stated constraint
+uv run sync_gcal.py             # mirror it into the "F26 Plan" Google Calendar
 ```
 
 ## Files
@@ -21,12 +22,14 @@ uv run verify.py                # check the result against every stated constrai
 | `verify.py` | Independent constraint checker; exits non-zero on violation |
 | `calendar.html` | Week-grid view, Google-Calendar style |
 | `schedule.json` | Machine-readable output |
+| `sync_gcal.py` | Pushes the plan into the "F26 Plan" Google Calendar |
+| `gcal.json` | That calendar's id, written by the first sync |
 | `_gen_tasks.py` | One-off that built `tasks.yaml`; kept for provenance |
 
 ## Changing the plan in plain English
 
-Tell Claude what changed and it edits the right file, re-runs, and re-verifies. The
-translations are mechanical:
+Tell Claude what changed and it edits the right file, re-runs, re-verifies, and syncs the
+calendar. The translations are mechanical:
 
 | You say | What changes |
 |---|---|
@@ -108,39 +111,41 @@ ENVS*2210 penalises clustering posts into the final 24 hours.
 - Max 7 core hours and 9.5 total hours in a day; exam days max 4 hours, no evenings
 - Oct 5–10 written off (away)
 
-## Getting the plan onto a real calendar (options, not built yet)
+## Google Calendar sync
 
-Researched 2026-09-21. Nothing here touches Google Calendar yet.
+`sync_gcal.py` mirrors the plan into a dedicated **"F26 Plan"** calendar: every work block,
+plus an all-day ⚑ event on each hand-in's real deadline. Each event carries a stable key and a
+content hash, so a re-run only adds, updates or deletes what changed. Days before the plan
+start are left alone as history. `--dry-run` reports the changes without writing.
 
-| Option | Update lag after a reflow | Setup | What it touches |
-|---|---|---|---|
-| 1. API sync into a dedicated "F26 Plan" calendar | seconds | Google Cloud project + OAuth desktop client, once (~15 min) | Creates one secondary calendar. Scope `calendar.app.created` can only see calendars the script created, so the primary calendar is out of reach. |
-| 2. ICS feed at a secret gist URL, subscribed "From URL" | 12-24 h in Google Calendar, no manual refresh; ~1 h in Apple Calendar | `gh gist create` | Nothing in Google, but anyone holding the URL can read the plan. |
-| 3. One-off `.ics` import | never (static) | none | Imports events; every reflow needs delete + re-import. |
+How it connects (set up 2026-09-21):
 
-Option 1 is the one that fits this planner: reflows happen on the day something comes up, and a
-12-24 h lag means the calendar shows the old plan exactly when it matters.
+- GCP project `your-gcp-project` on you@example.com, with the Calendar and IAM Credentials
+  APIs enabled.
+- Service account `planner-bot@your-project.iam.gserviceaccount.com` owns the calendar and
+  shares it read-only with you@example.com. It has no access to any of Zach's own
+  calendars.
+- The script impersonates the service account using the gcloud login already on this machine,
+  so no key file or client secret is stored anywhere. That needs one grant, run once by Zach:
+  `gcloud iam service-accounts add-iam-policy-binding planner-bot@your-project.iam.gserviceaccount.com --project your-gcp-project --member user:you@example.com --role roles/iam.serviceAccountTokenCreator`
 
-Gotchas for option 1:
+Why a synced calendar rather than a subscribed ICS feed: Google Calendar refreshes URL
+subscriptions every 12-24 h with no manual refresh, so a same-day reflow would show the old plan
+exactly when it matters. A synced calendar updates in seconds.
 
-- An OAuth client whose consent screen is External + Testing gets refresh tokens that die after
-  7 days. A personal Gmail account cannot choose Internal, so set the publishing status to
-  "In production" (one "unverified app" warning at consent, then the token persists).
-- Key every synced event on a stable id (task id + session index) so a re-sync updates or deletes
-  events instead of duplicating them.
+Why a service account rather than an OAuth sign-in client: an External OAuth app in Testing
+gets refresh tokens that expire after 7 days, and publishing it to production requires a home
+page and privacy-policy link on an authorized domain. The first attempt left an unused OAuth
+consent screen and desktop client ("F26 plan sync (Mac)") in the project.
 
-A live calendar also needs the plan to know what actually got done, or it drifts after the first
-skipped block. `progress.yaml` covers that: planning starts the day after `through`, logged
-minutes come off each task, and anything the plan had put before then that is not logged is
-rescheduled. Work whose deadline has already passed is scheduled as soon as it physically can
-be, and `verify.py` reports it as overdue instead of failing.
-
-Sources: [Calendar API scopes](https://developers.google.com/workspace/calendar/api/auth),
-[Calendars: insert](https://developers.google.com/workspace/calendar/api/v3/reference/calendars/insert),
+Sources: [Calendars: insert](https://developers.google.com/workspace/calendar/api/v3/reference/calendars/insert),
 [ICS refresh rates](https://calfeed.ai/learn/ics-refresh-rate-apple-google),
 [7-day testing tokens](https://dev.to/ko-hi/googles-oauth-testing-mode-expires-refresh-tokens-in-7-days-publish-the-consent-screen-before-24hm).
 
 ## Current state
+
+Calendar sync is built and dry-runs clean (244 events: 221 work blocks, 23 deadlines). The first
+real sync waits on the one-time impersonation grant above.
 
 Progress logged through Mon Sep 21 with nothing done, so the plan runs from Tue Sep 22:
 394.8 h across 76 working days with Oct 5–10 written off and **hand-ins finishing 3 days
