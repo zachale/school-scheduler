@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["google-api-python-client", "google-auth", "pyyaml"]
+# dependencies = ["google-api-python-client", "google-auth"]
 # ///
 """Mirror the term plan into a dedicated Google Calendar, "F26 Plan".
 
@@ -29,7 +29,6 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import google.oauth2.credentials
-import yaml
 from google.auth import impersonated_credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -43,18 +42,6 @@ NAME = "F26 Plan"
 TZ = "America/Toronto"
 RETRIES = 6
 
-# Google Calendar's event colours as the web UI draws them, by colorId
-PALETTE = {"1": "#7986cb", "2": "#33b679", "3": "#8e24aa", "4": "#e67c73",
-           "5": "#f6bf26", "6": "#f4511e", "7": "#039be5", "8": "#616161",
-           "9": "#3f51b5", "10": "#0b8043", "11": "#d50000"}
-
-
-def colour_id(hex_colour: str) -> str:
-    """The event colour closest to a planner colour."""
-    rgb = lambda h: tuple(int(h[i:i + 2], 16) for i in (1, 3, 5))
-    target = rgb(hex_colour)
-    return min(PALETTE, key=lambda k: sum((a - b) ** 2 for a, b in zip(rgb(PALETTE[k]), target)))
-
 
 def service():
     token = subprocess.run(["gcloud", "auth", "print-access-token", OWNER],
@@ -65,8 +52,10 @@ def service():
     return build("calendar", "v3", credentials=creds, cache_discovery=False)
 
 
-def desired_events(schedule: list[dict], tasks: list[dict], colours: dict) -> dict[str, dict]:
-    """Every event the calendar should hold from the plan start on, by stable key."""
+def desired_events(schedule: list[dict], tasks: list[dict]) -> dict[str, dict]:
+    """Every event the calendar should hold from the plan start on, by stable key.
+    No per-event colours: Google shows an event's colour only to the calendar owner,
+    so on Zach's side every event takes the calendar's colour."""
     start = schedule[0]["date"]
     out: dict[str, dict] = {}
     for day in schedule:
@@ -84,7 +73,6 @@ def desired_events(schedule: list[dict], tasks: list[dict], colours: dict) -> di
                 "description": "\n".join(lines),
                 "start": {"dateTime": f"{day['date']}T{b['start']}:00", "timeZone": TZ},
                 "end": {"dateTime": f"{day['date']}T{b['end']}:00", "timeZone": TZ},
-                "colorId": colour_id(colours[b["course"]]),
                 "transparency": "opaque",
             }
     last = {b["task"]: day["date"] for day in schedule for b in day["work"]}
@@ -99,7 +87,6 @@ def desired_events(schedule: list[dict], tasks: list[dict], colours: dict) -> di
                            f"{(due.date() - done).days} days before.",
             "start": {"date": str(due.date())},
             "end": {"date": str(due.date() + dt.timedelta(days=1))},
-            "colorId": colour_id(colours[t["course"]]),
             "transparency": "transparent",
         }
     for key, ev in out.items():
@@ -153,10 +140,9 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true", help="report changes without writing")
     args = ap.parse_args()
 
-    cfg = yaml.safe_load((HERE / "config.yaml").read_text())
     schedule = json.loads((HERE / "schedule.json").read_text())
     tasks = json.loads((HERE / "resolved_tasks.json").read_text())
-    want = desired_events(schedule, tasks, cfg["colours"])
+    want = desired_events(schedule, tasks)
 
     svc = service()
     cid = ensure_calendar(svc, args.dry_run)

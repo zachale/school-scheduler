@@ -126,7 +126,8 @@ How it connects (set up 2026-09-21):
   shares it read-only with you@example.com. It has no access to any of Zach's own
   calendars.
 - The script impersonates the service account using the gcloud login already on this machine,
-  so no key file or client secret is stored anywhere. That needs one grant, run once by Zach:
+  so no key file or client secret is stored anywhere. That rests on one grant (Zach ran it
+  2026-09-21):
   `gcloud iam service-accounts add-iam-policy-binding planner-bot@your-project.iam.gserviceaccount.com --project your-gcp-project --member user:you@example.com --role roles/iam.serviceAccountTokenCreator`
 
 Why a synced calendar rather than a subscribed ICS feed: Google Calendar refreshes URL
@@ -144,8 +145,10 @@ Sources: [Calendars: insert](https://developers.google.com/workspace/calendar/ap
 
 ## Current state
 
-Calendar sync is built and dry-runs clean (244 events: 221 work blocks, 23 deadlines). The first
-real sync waits on the one-time impersonation grant above.
+Calendar sync is live (2026-09-21): "F26 Plan" holds 244 events (221 work blocks, 23
+deadlines) and appears under Other calendars in you@example.com's Google Calendar. A
+re-sync with no plan change reports 0 changes. Events show in the calendar's own colour;
+Google only shows per-event colours to the calendar owner.
 
 Progress logged through Mon Sep 21 with nothing done, so the plan runs from Tue Sep 22:
 394.8 h across 76 working days with Oct 5–10 written off and **hand-ins finishing 3 days
