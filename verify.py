@@ -59,6 +59,9 @@ for day in sched:
         continue
 
     for ws, we, wb in work:
+        if we - ws > S["default_max_minutes"] + 15:   # 15 min tolerance absorbs a sliver
+            fails.append(f"{date} session too long: {wb['title']} {wb['start']}-{wb['end']} "
+                         f"({(we-ws)/60:.1f} h > {S['default_max_minutes']/60:.0f} h)")
         for fs, fe, fb in fixed:
             if ws < fe and fs < we:
                 fails.append(f"{date} overlap: {wb['title']} vs {fb['title']}")
@@ -173,6 +176,8 @@ check(not bad_spread, f"discussion posts on separate days, >=2 days apart ({len(
 check(missed <= have_cu, f"catch-up generated for every course that missed lectures ({', '.join(sorted(missed)) or 'none'})",
       f"missing catch-up for {sorted(missed - have_cu)}")
 check(not any("cap exceeded" in f for f in fails), f"daily caps held (busiest {maxday:.1f} h)")
+check(not any("session too long" in f for f in fails),
+      f"every session <= {S['default_max_minutes']//60} h, with a break after long ones")
 
 for o in oks:   print(f"  ok   {o}")
 for w in warns: print(f"  warn {w}")

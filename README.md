@@ -39,6 +39,7 @@ translations are mechanical:
 | "assignment 2 moved to the 16th" | the `due` on that task |
 | "I'm sick this week" / "write off the 5th–10th" | a range under `unavailable` in `config.yaml` |
 | "the CIS 3210 final is Dec 14 at 2pm" | a row under `exams` in `config.yaml` |
+| "finish assignments a week early" | `early_finish.days: 7` |
 
 ## Write-offs
 
@@ -53,9 +54,31 @@ A range under `unavailable` means no work and no classes. The planner then, on i
 Nothing is hand-moved, so a later "I'm sick Tuesday" gets identical treatment. `verify.py`
 checks every adjusted item against its **real** deadline, not just the adjusted one.
 
+## Finishing early
+
+`early_finish.days` aims every hand-in item that many days before its real deadline.
+Exam prep, readings and discussions are deliberately excluded. An item is never pulled
+earlier than it can physically be done after release; where that bites, the achieved
+buffer is reported in `resolved_tasks.json` as `buffer_days`. `early_finish.from` phases
+it in from a date.
+
+Explored 2026-09-21 (total hours are fixed, so finishing early moves work, it does not
+create time):
+
+| Scenario | Evenings | Busiest | 8 h+ days | This week | Exam week |
+|---|---:|---:|---:|---:|---:|
+| Off (current) | 0.3 h | 7.0 h | 0 | 35.6 h | 45.2 h |
+| 3 days early | 10.6 h | 8.2 h | 1 | 35.5 h | 35.1 h |
+| 7 days early | 24.2 h | 9.5 h | 4 | 41.7 h | 17.9 h |
+| 7 days early, from Oct 1 | 23.0 h | 9.5 h | 5 | 35.6 h | 17.9 h |
+
+The greedy scheduler is not monotonic in this setting: 5 days early fails where 3 and 7
+pass, because the CIS*4020 presentation lands squarely in the Nov 12–18 crunch.
+
 ## How it schedules
 
-Sessions are 1–3 hours. Tasks are ordered by **latest feasible start** — deadline minus
+Sessions are 1–3 hours, and any session of 90 minutes or more is followed by a
+15-minute break before the next. Tasks are ordered by **latest feasible start** — deadline minus
 the *available* days the remaining work needs — rather than by deadline alone, so a large
 item due late still starts early enough, and a blocked stretch makes the work around it
 start sooner.

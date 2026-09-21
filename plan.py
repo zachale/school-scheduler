@@ -241,6 +241,34 @@ def prepare(cfg: dict, tasks: list[dict], blocked: dict, start_from: dt.date):
                            f"{new:%b %d}-{t['_due']:%b %d}")
             t["_earliest"] = new
 
+    # early finish: aim hand-in work N days ahead of its real deadline, but never
+    # earlier than it can physically be completed after it is released
+    ef = cfg.get("early_finish") or {}
+    N, kinds = int(ef.get("days", 0)), set(ef.get("kinds", ["work"]))
+    ef_from = ef.get("from")
+    if N:
+        for t in tasks:
+            if t["kind"] not in kinds:
+                continue
+            if ef_from and t["_orig_due"].date() < ef_from:
+                continue
+            target = t["_orig_due"] - dt.timedelta(days=N)
+            if target.date() in blocked:
+                target = dt.datetime.combine(last_avail_on_or_before(target.date()),
+                                             dt.time(22, 0))
+            need, d = max(1, math.ceil(t["minutes"] / 300)), t["_earliest"]
+            while not avail(d):                  # can't start on a blocked day
+                d += dt.timedelta(days=1)
+            while need > 1:                      # earliest it could possibly finish
+                d += dt.timedelta(days=1)
+                if avail(d):
+                    need -= 1
+            floor = dt.datetime.combine(d, dt.time(22, 0))
+            new = max(target, floor)
+            if new < t["_due"]:
+                t["_due"] = new
+            t["_buffer_days"] = (t["_orig_due"].date() - t["_due"].date()).days
+
     # spread groups: split each group evenly across its available days
     groups: dict[str, list[dict]] = {}
     for t in tasks:
@@ -364,16 +392,29 @@ def schedule(cfg: dict, tasks: list[dict], events: list[dict], start_from: dt.da
 
                 placed = False
                 for t in live:
+                    # on the due date itself, nothing may run past the due time
+                    cutoff = (t["_due"].hour * 60 + t["_due"].minute
+                              if t["_due"].date() == day.date else 24 * 60)
                     for si, (s, e) in enumerate(sorted(slots)):
+                        e = min(e, cutoff)
+                        if e - s < 20:
+                            continue
                         room = int(min(e - s, cap - used))
                         chunk = int(min(t["remaining"], t["max_minutes"], room))
                         if chunk < min(t["min_minutes"], t["remaining"]):
                             continue
-                        # never leave a sliver of a task behind
+                        # never leave a sliver of a task behind: absorb a leftover under
+                        # 20 min into this session, allowing up to 15 min past the max
                         if 0 < t["remaining"] - chunk < 20:
-                            chunk = t["remaining"]
-                            if chunk > room:
-                                continue
+                            if t["remaining"] <= min(room, t["max_minutes"] + 15):
+                                chunk = t["remaining"]
+                            else:
+                                chunk = t["remaining"] - 20   # leave a real session instead
+                        brk_after = S.get("break_after_minutes", 90)
+                        brk = S.get("break_minutes", 15)
+                        if chunk >= brk_after and s + chunk + brk <= e:
+                            day.fixed.append({"start": s + chunk, "end": s + chunk + brk,
+                                              "title": "Break", "cat": "Break"})
                         day.blocks.append({
                             "start": s, "end": s + chunk, "title": t["title"],
                             "cat": t["course"], "course": t["course"], "task": t["id"],
@@ -393,9 +434,10 @@ def schedule(cfg: dict, tasks: list[dict], events: list[dict], start_from: dt.da
         # merge back-to-back sessions of the same task into one readable block
         merged: list[dict] = []
         for b in day.blocks:
-            if merged and merged[-1]["task"] == b["task"] and merged[-1]["end"] == b["start"]:
+            if (merged and merged[-1]["task"] == b["task"] and merged[-1]["end"] == b["start"]
+                    and merged[-1]["overflow"] == b["overflow"]
+                    and b["end"] - merged[-1]["start"] <= S["default_max_minutes"]):
                 merged[-1]["end"] = b["end"]
-                merged[-1]["overflow"] = merged[-1]["overflow"] or b["overflow"]
             else:
                 merged.append(b)
         day.blocks = merged
@@ -571,6 +613,7 @@ def main() -> None:
         "kind": t["kind"], "earliest": str(t["_earliest"]),
         "due": f"{t['_due']:%Y-%m-%d %H:%M}", "orig_due": f"{t['_orig_due']:%Y-%m-%d %H:%M}",
         "spread_group": t.get("spread_group"), "note": t.get("note", ""),
+        "buffer_days": t.get("_buffer_days"),
     } for t in tasks], indent=1))
     (HERE / "schedule.json").write_text(json.dumps([{
         "date": str(d.date),
