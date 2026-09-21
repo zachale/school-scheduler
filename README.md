@@ -130,6 +130,21 @@ How it connects (set up 2026-09-21):
   2026-09-21):
   `gcloud iam service-accounts add-iam-policy-binding planner-bot@your-project.iam.gserviceaccount.com --project your-gcp-project --member user:you@example.com --role roles/iam.serviceAccountTokenCreator`
 
+Reading Zach's own calendar (options, 2026-09-21, not built yet). The planner cannot see it
+today, which is how a Sep 26 wedding ended up under study blocks. Ranked:
+
+1. Share the "Zach Legesse" calendar with the service account as **free/busy only**. Each
+   replan queries busy times and blocks them like `events.yaml` rows. The robot never sees
+   titles, so busy slots matching a class or lab the planner already models are skipped
+   (labs need their times back in `config.yaml`), and off-campus travel is unknown, so a
+   default buffer applies.
+2. Share it with **all event details**. Titles allow filtering classes and labs by course code
+   and locations hint at travel, at the cost of the robot reading everything.
+3. Keep telling Claude in chat (`events.yaml`). No setup, but it only works when remembered.
+
+Only events marked Busy block time, so all-day items like birthdays are ignored either way.
+Calendar changes are picked up at the next replan, not on their own.
+
 Why a synced calendar rather than a subscribed ICS feed: Google Calendar refreshes URL
 subscriptions every 12-24 h with no manual refresh, so a same-day reflow would show the old plan
 exactly when it matters. A synced calendar updates in seconds.
