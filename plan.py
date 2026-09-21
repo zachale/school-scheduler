@@ -484,6 +484,11 @@ h1{margin:0 0 3px;font-size:19px;font-weight:500}
 .ev.meal,.ev.travel{font-size:9px}
 .ev.of{background-image:repeating-linear-gradient(45deg,transparent,transparent 5px,
        rgba(255,255,255,.14) 5px,rgba(255,255,255,.14) 10px)}
+.dl{height:30px;border-bottom:1px solid var(--line);padding:2px 3px;overflow:hidden;
+    display:flex;flex-direction:column;gap:2px;background:#fafafa}
+.dl .pill{font-size:9px;line-height:12px;border-radius:3px;padding:0 4px;color:#fff;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dl .more{font-size:9px;color:var(--mut)}
 .legend{display:flex;gap:14px;flex-wrap:wrap;margin:10px 0 0;font-size:11px;align-items:center}
 .sw{display:inline-block;width:11px;height:11px;border-radius:2px;margin-right:5px;
     vertical-align:-1px}
@@ -512,8 +517,19 @@ def render(days, unplaced, cfg, tasks) -> str:
             cls += " meal"
         label = f'{b["course"]} · {b["title"]}' if not fixed and b.get("course") else b["title"]
         sub = f"{fmt(b['start'])}–{fmt(b['end'])}"
+        tip = f"{label} · {sub}"
+        if not fixed and b.get("due"):
+            tip += f" · really due {b['due']}"
         return (f'<div class="{cls}" style="top:{top:.1f}px;height:{h:.1f}px;background:{col}" '
-                f'title="{label} · {sub}"><b>{label}</b><span class="t">{sub}</span></div>')
+                f'title="{tip}"><b>{label}</b><span class="t">{sub}</span></div>')
+
+    # real deadlines of hand-in work, flagged on the day they are actually due
+    ef_days = int((cfg.get("early_finish") or {}).get("days", 0))
+    deadlines: dict[dt.date, list] = {}
+    for tk in tasks:
+        if tk["kind"] != "work":
+            continue
+        deadlines.setdefault(tk["_orig_due"].date(), []).append(tk)
 
     # group days into weeks (Mon-start)
     weeks: dict[dt.date, list] = {}
@@ -527,7 +543,9 @@ def render(days, unplaced, cfg, tasks) -> str:
     out.append('<header><h1>Fall 2026 — time-blocked plan</h1>'
                f'<div class="sub">{len(tasks)} tasks · {total/60:.0f} h scheduled '
                f'({of/60:.0f} h in evening overflow) · '
-               f'{days[0].date:%b %d} – {days[-1].date:%b %d}</div>'
+               f'{days[0].date:%b %d} – {days[-1].date:%b %d}'
+               + (f' · hand-ins finish <b>{ef_days} days</b> before their real deadline (⚑)'
+                  if ef_days else "") + '</div>'
                '<div class="legend">'
                + "".join(f'<span><i class="sw" style="background:{c}"></i>{k}</span>'
                          for k, c in colours.items())
@@ -554,7 +572,8 @@ def render(days, unplaced, cfg, tasks) -> str:
                    f'{mon:%B %d}</span><span class="load">{load/60:.1f} h '
                    f'({cor/60:.1f} core + {ovf/60:.1f} overflow)</span></div><div class="grid">')
         # time axis
-        out.append('<div class="daycol axis"><div class="dayhd"></div><div class="body">')
+        out.append('<div class="daycol axis"><div class="dayhd"></div>'
+                   '<div class="dl" style="background:none"></div><div class="body">')
         for t in range(T0, T1, 60):
             out.append(f'<div class="hr">{fmt(t)}</div>')
         out.append('</div></div>')
@@ -565,8 +584,17 @@ def render(days, unplaced, cfg, tasks) -> str:
             off = "" if d else " off"
             tod = " today" if date == today else ""
             out.append(f'<div class="daycol"><div class="dayhd{off}{tod}">'
-                       f'<div class="dow">{DAYS[i]}</div><div class="num">{date.day}</div></div>'
-                       '<div class="body">')
+                       f'<div class="dow">{DAYS[i]}</div><div class="num">{date.day}</div></div>')
+            dls = deadlines.get(date, [])
+            out.append('<div class="dl">')
+            for tk in dls[:2]:
+                col = colours.get(tk["course"], "#5f6368")
+                out.append(f'<div class="pill" style="background:{col}" '
+                           f'title="REAL DEADLINE {tk["_orig_due"]:%a %b %d %H:%M} · '
+                           f'{tk["course"]} {tk["title"]}">⚑ {tk["course"]} {tk["title"]}</div>')
+            if len(dls) > 2:
+                out.append(f'<div class="more">+{len(dls) - 2} more due</div>')
+            out.append('</div><div class="body">')
             for t in range(T0, T1, 60):
                 out.append('<div class="hr"></div>')
             if d:

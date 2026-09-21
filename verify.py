@@ -176,6 +176,30 @@ check(not bad_spread, f"discussion posts on separate days, >=2 days apart ({len(
 check(missed <= have_cu, f"catch-up generated for every course that missed lectures ({', '.join(sorted(missed)) or 'none'})",
       f"missing catch-up for {sorted(missed - have_cu)}")
 check(not any("cap exceeded" in f for f in fails), f"daily caps held (busiest {maxday:.1f} h)")
+# early finish: every hand-in's last session lands >= N days before its real deadline
+ef = cfg.get("early_finish") or {}
+EF, EF_FROM = int(ef.get("days", 0)), ef.get("from")
+if EF:
+    last = {}
+    for day in sched:
+        for b in day["work"]:
+            last[b["task"]] = max(last.get(b["task"], day["date"]), day["date"])
+    short_buf = []
+    for tid, tk in tasks.items():
+        if tk["kind"] not in set(ef.get("kinds", ["work"])) or tid not in last:
+            continue
+        real = dtm(tk["orig_due"]).date()
+        if EF_FROM and real < EF_FROM:
+            continue
+        got = (real - dt.date.fromisoformat(last[tid])).days
+        want = min(EF, tk.get("buffer_days") or EF)   # release may cap it
+        if got < want:
+            short_buf.append(f"{tid}: finishes {got} d early, expected {want}")
+    fails += short_buf
+    n_items = sum(1 for tid, tk in tasks.items() if tk["kind"] in set(ef.get("kinds", ["work"])))
+    check(not short_buf, f"all {n_items} hand-ins finish >= {EF} days before their real deadline",
+          f"{len(short_buf)} hand-ins short of the {EF}-day buffer")
+
 check(not any("session too long" in f for f in fails),
       f"every session <= {S['default_max_minutes']//60} h, with a break after long ones")
 

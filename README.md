@@ -108,7 +108,13 @@ ENVS*2210 penalises clustering posts into the final 24 hours.
 
 ## Current state
 
-394.8 h across 78 working days with Oct 5–10 written off, **entirely inside core hours**
-— zero evening overflow, no day over 7 h. `verify.py` passes every check.
+394.8 h across 77 working days with Oct 5–10 written off and **hand-ins finishing 3 days
+early** (adopted 2026-09-21). Every one of the 23 hand-ins lands at least 3 days before its
+real deadline; the median is 5 days and the pre-trip items get 9–11. Cost: 10.6 h of evening
+work across the term, busiest day 8.2 h. `verify.py` checks the buffer directly and passes
+every check.
+
+On the calendar, ⚑ flags sit on each hand-in's **real** deadline, so the gap between the
+last work block and the flag is the buffer.
 
 Hours come from [[fall-2026-effort-estimates]], which carries a +30% buffer.
