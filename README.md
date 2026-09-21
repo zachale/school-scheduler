@@ -37,13 +37,36 @@ translations are mechanical:
 | "Antonie posted the project spec" | a revised `cis4020-*` block |
 | "I'm dropping MATH 4310 A5" | delete `math4310-a5` |
 | "assignment 2 moved to the 16th" | the `due` on that task |
-| "I'm sick this week" | an all-day event per affected day |
+| "I'm sick this week" / "write off the 5th–10th" | a range under `unavailable` in `config.yaml` |
+| "the CIS 3210 final is Dec 14 at 2pm" | a row under `exams` in `config.yaml` |
+
+## Write-offs
+
+A range under `unavailable` means no work and no classes. The planner then, on its own:
+
+1. pulls any deadline that falls inside it back to the evening before it starts,
+2. moves work whose whole window is blocked to the week before,
+3. re-spreads discussion posts across the days actually available,
+4. **generates catch-up for every lecture missed** (1.5 h each, +30%), due within a week of
+   returning, and drops that week's review since the catch-up covers it.
+
+Nothing is hand-moved, so a later "I'm sick Tuesday" gets identical treatment. `verify.py`
+checks every adjusted item against its **real** deadline, not just the adjusted one.
 
 ## How it schedules
 
 Sessions are 1–3 hours. Tasks are ordered by **latest feasible start** — deadline minus
-the days the remaining work needs — rather than by deadline alone, so a large item due
-late still starts early enough. Core hours (09:00–17:00) fill first; evening overflow
+the *available* days the remaining work needs — rather than by deadline alone, so a large
+item due late still starts early enough, and a blocked stretch makes the work around it
+start sooner.
+
+Exam preparation opens 21 days out. That is a pacing allowance, not a release date: the
+planner only uses the early part when there is spare time, which is what lets it put prep
+into the days before a write-off. Exam days are capped at 4 hours with no evening work.
+
+A "comfortable daily target" below the 7-hour cap was tried and removed. A sweep of 5.5,
+6.0 and 6.5 hours pushed 20–35 hours of work into evenings and worsened the peak days,
+because class days cannot reach those targets in core hours. Core hours (09:00–17:00) fill first; evening overflow
 (17:00–22:00) is used only for work whose latest start has already arrived.
 
 Discussion posts carry staggered internal deadlines and a 2-day minimum gap, because
@@ -57,11 +80,12 @@ ENVS*2210 penalises clustering posts into the final 24 hours.
   back-to-back classes
 - Friday labs omitted — unmarked, done online
 - No classes Oct 12–13; Dec 3 runs a Tuesday schedule and Dec 4 a Monday schedule
-- Max 7 core hours and 9.5 total hours in a day
+- Max 7 core hours and 9.5 total hours in a day; exam days max 4 hours, no evenings
+- Oct 5–10 written off (away)
 
 ## Current state
 
-370.1 h across 76 working days, **entirely inside core hours** — zero evening overflow
-needed. Busiest day is 7.0 h. `verify.py` passes every check.
+394.8 h across 78 working days with Oct 5–10 written off, **entirely inside core hours**
+— zero evening overflow, no day over 7 h. `verify.py` passes every check.
 
 Hours come from [[fall-2026-effort-estimates]], which carries a +30% buffer.

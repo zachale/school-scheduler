@@ -58,26 +58,60 @@ def subtract(free: list[tuple[int, int]], busy: tuple[int, int]) -> list[tuple[i
     return [(s, e) for s, e in out if e > s]
 
 
+# ---------- unavailability ---------------------------------------------------
+def blocked_dates(cfg: dict) -> dict[dt.date, str]:
+    """Every whole day with no work and no classes, mapped to its reason."""
+    out: dict[dt.date, str] = {}
+    for u in cfg.get("unavailable") or []:
+        d = u["from"]
+        while d <= u["to"]:
+            out[d] = u.get("reason", "Unavailable")
+            d += dt.timedelta(days=1)
+    return out
+
+
+def class_weekday(cfg: dict, date: dt.date) -> int | None:
+    for o in cfg.get("schedule_overrides") or []:
+        if o["date"] == date:
+            return o["runs_schedule_of"]
+    for n in cfg.get("no_class_days") or []:
+        if n["date"] == date:
+            return None
+    if date > cfg["term"]["last_class_day"]:
+        return None
+    return date.weekday()
+
+
+def missed_lectures(cfg: dict, blocked: dict) -> dict[str, list[dt.date]]:
+    """Lectures that would have run on a blocked day, by course."""
+    out: dict[str, list[dt.date]] = {}
+    for d in sorted(blocked):
+        wd = class_weekday(cfg, d)
+        if wd is None:
+            continue
+        for c in cfg["classes"]:
+            if wd in c["days"]:
+                out.setdefault(c["course"], []).append(d)
+    return out
+
+
 # ---------- the day model ----------------------------------------------------
 class Day:
-    def __init__(self, date: dt.date, cfg: dict, events: list[dict]):
+    def __init__(self, date: dt.date, cfg: dict, events: list[dict], blocked: dict):
         self.date = date
         self.cfg = cfg
         self.fixed: list[dict] = []          # classes, travel, meals, ad-hoc
         self.blocks: list[dict] = []         # scheduled work
-        self._build(events)
+        self.blocked = blocked.get(date)
+        if self.blocked:
+            self.fixed.append({"start": hm("07:00"), "end": hm("22:00"),
+                               "title": self.blocked, "cat": "Personal"})
+        else:
+            self._build(events)
 
     # -- fixed commitments
     def _class_weekday(self) -> int | None:
-        for o in self.cfg.get("schedule_overrides") or []:
-            if o["date"] == self.date:
-                return o["runs_schedule_of"]
-        for n in self.cfg.get("no_class_days") or []:
-            if n["date"] == self.date:
-                return None
-        if self.date > self.cfg["term"]["last_class_day"]:
-            return None
-        return self.date.weekday()
+        return class_weekday(self.cfg, self.date)
 
     def _build(self, events: list[dict]) -> None:
         trav = self.cfg["travel"]["minutes_each_way"]
@@ -103,11 +137,28 @@ class Day:
                                "cat": "Travel"})
             for c in cs:
                 cs_ = next(x for x in classes if x[2] is c)
+                ex = next((x for x in self.cfg.get("exams") or []
+                           if x["date"] == self.date and x["course"] == c["course"]
+                           and x.get("in_class")), None)
                 self.fixed.append({"start": cs_[0], "end": cs_[1],
-                                   "title": f"{c['course']} {c['kind']} - {c['room']}",
-                                   "cat": "Class", "course": c["course"]})
+                                   "title": (f"{c['course']} {ex['title']} - {c['room']}" if ex
+                                             else f"{c['course']} {c['kind']} - {c['room']}"),
+                                   "cat": "Exam" if ex else "Class", "course": c["course"]})
             self.fixed.append({"start": e, "end": e + trav, "title": "Travel home",
                                "cat": "Travel"})
+
+        # exams outside lecture time
+        for ex in self.cfg.get("exams") or []:
+            if ex["date"] != self.date or ex.get("in_class"):
+                continue
+            s, e = hm(ex["start"]), hm(ex["end"])
+            if ex.get("travel"):
+                self.fixed.append({"start": s - trav, "end": s, "title": "Travel to exam",
+                                   "cat": "Travel"})
+                self.fixed.append({"start": e, "end": e + trav, "title": "Travel home",
+                                   "cat": "Travel"})
+            self.fixed.append({"start": s, "end": e, "cat": "Exam", "course": ex["course"],
+                               "title": f"{ex['course']} {ex['title']} - {ex.get('room', '')}"})
 
         # ad-hoc events
         for ev in events:
@@ -142,6 +193,8 @@ class Day:
 
     # -- capacity
     def slots(self, overflow: bool) -> list[tuple[int, int]]:
+        if self.blocked:
+            return []
         w = self.cfg["work_hours"]
         if not overflow and not w.get("include_weekends", True) and self.date.weekday() >= 5:
             return []
@@ -157,37 +210,133 @@ class Day:
         return sum(b["end"] - b["start"] for b in self.blocks if b["overflow"] is overflow)
 
 
+# ---------- task preparation -------------------------------------------------
+def prepare(cfg: dict, tasks: list[dict], blocked: dict, start_from: dt.date):
+    """Resolve each task's real window against the days actually available.
+    Returns the working task list and a human-readable list of what changed."""
+    changes: list[str] = []
+    avail = lambda d: d not in blocked
+
+    def last_avail_on_or_before(d: dt.date) -> dt.date:
+        while not avail(d):
+            d -= dt.timedelta(days=1)
+        return d
+
+    for t in tasks:
+        t["_orig_due"] = dt.datetime.strptime(t["due"], "%Y-%m-%d %H:%M")
+        t["_due"] = t["_orig_due"]
+        t["_earliest"] = dt.date.fromisoformat(str(t["earliest"]))
+
+        # a deadline inside a blocked stretch moves to the evening before it
+        if not avail(t["_due"].date()):
+            d = last_avail_on_or_before(t["_due"].date())
+            t["_due"] = dt.datetime.combine(d, dt.time(22, 0))
+            changes.append(f"{t['course']} {t['title']}: finish by {d:%a %b %d} "
+                           f"(really due {t['_orig_due']:%a %b %d})")
+
+        # a window that is now empty opens up the week before
+        if t["_earliest"] > t["_due"].date():
+            new = max(start_from, t["_due"].date() - dt.timedelta(days=6))
+            changes.append(f"{t['course']} {t['title']}: moved earlier, now "
+                           f"{new:%b %d}-{t['_due']:%b %d}")
+            t["_earliest"] = new
+
+    # spread groups: split each group evenly across its available days
+    groups: dict[str, list[dict]] = {}
+    for t in tasks:
+        if t.get("spread_group"):
+            groups.setdefault(t["spread_group"], []).append(t)
+    for gid, members in groups.items():
+        members.sort(key=lambda t: t["id"])
+        lo = max(min(t["_earliest"] for t in members), start_from)
+        hi = max(t["_due"] for t in members)
+        days = [lo + dt.timedelta(days=i) for i in range((hi.date() - lo).days + 1)]
+        days = [d for d in days if avail(d)]
+        n = len(members)
+        if not days:
+            continue
+        for j, t in enumerate(members):
+            a = days[min(len(days) - 1, (j * len(days)) // n)]
+            b = days[min(len(days) - 1, ((j + 1) * len(days)) // n - 1)]
+            t["_earliest"] = a
+            t["_due"] = hi if j == n - 1 else dt.datetime.combine(b, dt.time(22, 0))
+
+    # missed lectures become catch-up work, replacing that week's review
+    per = cfg.get("catchup", {}).get("minutes_per_missed_lecture", 117)
+    span = cfg.get("catchup", {}).get("days_to_complete", 7)
+    for course, dates in missed_lectures(cfg, blocked).items():
+        back = max(dates) + dt.timedelta(days=1)
+        while not avail(back):
+            back += dt.timedelta(days=1)
+        due = dt.datetime.combine(back + dt.timedelta(days=span - 1), dt.time(22, 0))
+        tasks.append({
+            "id": f"catchup-{course.lower()}", "course": course,
+            "title": f"Catch up {len(dates)} missed lectures", "minutes": len(dates) * per,
+            "earliest": str(back), "due": f"{due:%Y-%m-%d %H:%M}", "kind": "catchup",
+            "min_minutes": 60, "max_minutes": 180,
+            "note": "missed " + ", ".join(f"{d:%a %b %d}" for d in dates),
+            "_earliest": back, "_due": due, "_orig_due": due,
+        })
+        changes.append(f"{course}: +{pretty(len(dates) * per)} catch-up for "
+                       f"{len(dates)} missed lectures ({back:%b %d}-{due:%b %d})")
+        # the weekly review for a week you were not there is replaced by the catch-up
+        for t in list(tasks):
+            if (t["kind"] == "ongoing" and t["course"] == course
+                    and any(t["_earliest"] <= d <= t["_due"].date() for d in dates)):
+                tasks.remove(t)
+                changes.append(f"{course} {t['title']} ({t['_earliest']:%b %d} week): "
+                               f"dropped, covered by catch-up")
+    return tasks, changes
+
+
 # ---------- scheduler --------------------------------------------------------
 def schedule(cfg: dict, tasks: list[dict], events: list[dict], start_from: dt.date):
     term = cfg["term"]
     d0, d1 = max(term["start"], start_from), term["plan_until"]
-    days = [Day(d0 + dt.timedelta(days=i), cfg, events) for i in range((d1 - d0).days + 1)]
+    blocked = blocked_dates(cfg)
+    tasks, changes = prepare(cfg, tasks, blocked, d0)
+    days = [Day(d0 + dt.timedelta(days=i), cfg, events, blocked)
+            for i in range((d1 - d0).days + 1)]
 
     S = cfg["sessions"]
     core_cap = int(S["max_core_hours_per_day"] * 60)
     total_cap = int(S["max_total_hours_per_day"] * 60)
+    exam_cap = int(S.get("exam_day_max_hours", S["max_total_hours_per_day"]) * 60)
 
     for t in tasks:
         t["remaining"] = t["minutes"]
-        t["_due"] = dt.datetime.strptime(t["due"], "%Y-%m-%d %H:%M")
-        t["_earliest"] = dt.date.fromisoformat(str(t["earliest"]))
 
     def latest_start(t, today):
-        """Date by which this task must begin to still finish, at ~5h/day."""
-        days_needed = max(1, math.ceil(t["remaining"] / 300))
-        return t["_due"].date() - dt.timedelta(days=days_needed)
+        """Latest date this task can begin and still finish at ~5 h/day,
+        counting only days that are actually available."""
+        need = max(1, math.ceil(t["remaining"] / 300))
+        d = t["_due"].date()
+        while need > 0 and d > today:
+            d -= dt.timedelta(days=1)
+            if d not in blocked:
+                need -= 1
+        return d
 
     unplaced: list[dict] = []
     group_days: dict[str, list[dt.date]] = {}
 
+    # Per day, two passes: core hours with any live task, then evening overflow
+    # for pressed work only. An exam day is capped lower and never runs into the
+    # evening. (A lower "comfortable target" tier was tried and removed: every
+    # target below the core cap pushed work into evenings and worsened peak days.)
     for day in days:
-        for overflow in (False, True):
+        exam_day = any(b.get("cat") == "Exam" for b in day.fixed)
+        passes = [(False, core_cap, False), (True, total_cap, True)]
+        for overflow, cap, pressed_only in passes:
+            if exam_day:
+                if overflow:
+                    continue
+                cap = min(cap, exam_cap)
             while True:
                 slots = day.slots(overflow)
                 if not slots:
                     break
-                cap = total_cap if overflow else core_cap
-                used = day.worked() if overflow else day.worked(False)
+                used = day.worked()
                 if used >= cap:
                     break
 
@@ -206,8 +355,8 @@ def schedule(cfg: dict, tasks: list[dict], events: list[dict], start_from: dt.da
                         and spread_ok(t)]
                 if not live:
                     break
-                # only dip into overflow for work that is actually pressed
-                if overflow:
+                # past the comfortable target, only work that is actually pressed
+                if pressed_only:
                     live = [t for t in live if latest_start(t, day.date) <= day.date]
                     if not live:
                         break
@@ -254,7 +403,7 @@ def schedule(cfg: dict, tasks: list[dict], events: list[dict], start_from: dt.da
     for t in tasks:
         if t["remaining"] > 0:
             unplaced.append(t)
-    return days, unplaced
+    return days, unplaced, tasks, changes
 
 
 # ---------- rendering --------------------------------------------------------
@@ -414,15 +563,25 @@ def main() -> None:
     events = (yaml.safe_load((HERE / "events.yaml").read_text()) or {}).get("events") or []
 
     start_from = dt.date.fromisoformat(args.start) if args.start else cfg["term"]["start"]
-    days, unplaced = schedule(cfg, tasks, events, start_from)
+    days, unplaced, tasks, changes = schedule(cfg, tasks, events, start_from)
 
     (HERE / "calendar.html").write_text(render(days, unplaced, cfg, tasks))
+    (HERE / "resolved_tasks.json").write_text(json.dumps([{
+        "id": t["id"], "course": t["course"], "title": t["title"], "minutes": t["minutes"],
+        "kind": t["kind"], "earliest": str(t["_earliest"]),
+        "due": f"{t['_due']:%Y-%m-%d %H:%M}", "orig_due": f"{t['_orig_due']:%Y-%m-%d %H:%M}",
+        "spread_group": t.get("spread_group"), "note": t.get("note", ""),
+    } for t in tasks], indent=1))
     (HERE / "schedule.json").write_text(json.dumps([{
         "date": str(d.date),
         "fixed": [{**b, "start": fmt(b["start"]), "end": fmt(b["end"])} for b in d.fixed],
         "work": [{**b, "start": fmt(b["start"]), "end": fmt(b["end"])} for b in d.blocks],
     } for d in days], indent=1))
 
+    if changes:
+        print("adjusted for unavailability:")
+        for c in changes:
+            print(f"  · {c}")
     tot = sum(sum(b["end"] - b["start"] for b in d.blocks) for d in days)
     ovf = sum(d.worked(True) for d in days)
     busiest = max(days, key=lambda d: d.worked())

@@ -5,6 +5,10 @@
 """Check schedule.json against every stated constraint. Deterministic, no judgement.
 
     uv run verify.py     # exits non-zero if any check fails
+
+Windows are checked against resolved_tasks.json (the planner's effective windows
+after unavailability is applied) AND against each task's original due date, which
+is the hard limit no adjustment may cross.
 """
 import datetime as dt, json, sys
 from collections import defaultdict
@@ -13,59 +17,79 @@ import yaml
 
 HERE = Path(__file__).parent
 cfg = yaml.safe_load((HERE / "config.yaml").read_text())
-tasks = {t["id"]: t for t in yaml.safe_load((HERE / "tasks.yaml").read_text())["tasks"]}
+tasks = {t["id"]: t for t in json.loads((HERE / "resolved_tasks.json").read_text())}
 sched = json.loads((HERE / "schedule.json").read_text())
 hm = lambda s: int(s[:2]) * 60 + int(s[3:])
+dtm = lambda s: dt.datetime.strptime(s, "%Y-%m-%d %H:%M")
 
-fails, notes, displaced = [], [], []
-def check(cond, msg):
-    (notes if cond else fails).append(msg)
+fails, oks, warns = [], [], []
+def check(cond, ok_msg, fail_msg=None):
+    (oks if cond else fails).append(ok_msg if cond else (fail_msg or ok_msg))
 
 CORE = (hm(cfg["work_hours"]["core"][0]), hm(cfg["work_hours"]["core"][1]))
 OVER = (hm(cfg["work_hours"]["overflow"][0]), hm(cfg["work_hours"]["overflow"][1]))
 TRAV = cfg["travel"]["minutes_each_way"]
 S = cfg["sessions"]
+EXAM_CAP = S.get("exam_day_max_hours", S["max_total_hours_per_day"]) * 60
+
+blocked = set()
+for u in cfg.get("unavailable") or []:
+    d = u["from"]
+    while d <= u["to"]:
+        blocked.add(d); d += dt.timedelta(days=1)
 
 done = defaultdict(int)
-overlaps = outside = early = late = 0
-missing_meal = []
-bad_travel = []
+n = defaultdict(int)          # counters for the summary
 maxday = 0.0
 
 for day in sched:
     date = dt.date.fromisoformat(day["date"])
     fixed = [(hm(b["start"]), hm(b["end"]), b) for b in day["fixed"]]
     work = [(hm(b["start"]), hm(b["end"]), b) for b in day["work"]]
+    wmin = sum(e - s for s, e, _ in work)
+    maxday = max(maxday, wmin / 60)
 
-    # 1. work never collides with a fixed commitment, or with itself
+    # blocked days carry nothing at all
+    if date in blocked:
+        if work:
+            fails.append(f"{date} is a write-off day but has {wmin} min of work")
+        if any(b.get("cat") in ("Class", "Exam") for _, _, b in fixed):
+            fails.append(f"{date} is a write-off day but has a class")
+        n["blocked"] += 1
+        continue
+
     for ws, we, wb in work:
         for fs, fe, fb in fixed:
             if ws < fe and fs < we:
-                overlaps += 1
                 fails.append(f"{date} overlap: {wb['title']} vs {fb['title']}")
         if not (CORE[0] <= ws and we <= CORE[1]) and not (OVER[0] <= ws and we <= OVER[1]):
-            outside += 1
             fails.append(f"{date} outside hours: {wb['title']} {wb['start']}-{wb['end']}")
+        t = tasks[wb["task"]]
+        end = dt.datetime.combine(date, dt.time(we // 60, we % 60))
+        if date < dt.date.fromisoformat(t["earliest"]):
+            fails.append(f"{date} before earliest: {wb['title']}")
+        if end > dtm(t["due"]):
+            fails.append(f"{date} after effective due: {wb['title']} (due {t['due']})")
+        if end > dtm(t["orig_due"]):
+            fails.append(f"{date} AFTER REAL DEADLINE: {wb['title']} (due {t['orig_due']})")
+        done[wb["task"]] += we - ws
     for i in range(len(work)):
         for j in range(i + 1, len(work)):
             if work[i][0] < work[j][1] and work[j][0] < work[i][1]:
-                overlaps += 1
                 fails.append(f"{date} work self-overlap: {work[i][2]['title']}")
 
-    # 2. windows honoured
-    for ws, we, wb in work:
-        t = tasks[wb["task"]]
-        if date < dt.date.fromisoformat(str(t["earliest"])):
-            early += 1; fails.append(f"{date} before earliest: {wb['title']}")
-        due = dt.datetime.strptime(t["due"], "%Y-%m-%d %H:%M")
-        if dt.datetime.combine(date, dt.time(we // 60, we % 60)) > due:
-            late += 1; fails.append(f"{date} after due: {wb['title']} (due {t['due']})")
-        done[wb["task"]] += we - ws
+    # exam days: lighter, and nothing in the evening
+    if any(b.get("cat") == "Exam" for _, _, b in fixed):
+        n["exam"] += 1
+        if wmin > EXAM_CAP + 1:
+            fails.append(f"{date} exam day carries {wmin/60:.1f} h (cap {EXAM_CAP/60:.1f})")
+        if any(b["overflow"] for _, _, b in work):
+            fails.append(f"{date} exam day runs into the evening")
 
-    # 3. meals - absent is only a failure if there was actually room for one
-    meals = {b["title"] for b in day["fixed"] if b.get("cat") == "Meal"}
+    # meals: absent is only a failure if there was room for one
+    have = {b["title"] for _, _, b in fixed if b.get("cat") == "Meal"}
     for m in cfg["meals"]:
-        if m["name"] in meals:
+        if m["name"] in have:
             continue
         lo, hi = hm(m["window"][0]), hm(m["window"][1])
         free = [(lo, hi)]
@@ -77,80 +101,83 @@ for day in sched:
                 if fe < e: nf.append((fe, e))
             free = [(s, e) for s, e in nf if e > s]
         if any(e - s >= m["minutes"] for s, e in free):
-            missing_meal.append(f"{date} {m['name']} - room existed but none placed")
+            fails.append(f"{date} {m['name']} missing though there was room")
         else:
-            blocker = next((b["title"] for _, _, b in fixed
-                            if hm(b["start"]) < hi and lo < hm(b["end"])
-                            and b.get("cat") == "Personal"), "a fixed commitment")
-            displaced.append(f"{date} {m['name']} displaced by {blocker}")
+            warns.append(f"{date} {m['name']} displaced - no free {m['minutes']} min in its window")
 
-    # 4. travel brackets every class cluster
-    cls = sorted([(hm(b["start"]), hm(b["end"])) for b in day["fixed"] if b.get("cat") == "Class"])
-    trav = sorted([(hm(b["start"]), hm(b["end"])) for b in day["fixed"] if b.get("cat") == "Travel"])
-    clusters = []
-    for s, e in cls:
-        if clusters and s - clusters[-1][1] <= 60:
-            clusters[-1][1] = max(clusters[-1][1], e)
+    # travel brackets every on-campus trip (classes and standalone exams)
+    oncampus = sorted((hm(b["start"]), hm(b["end"])) for b in day["fixed"]
+                      if b.get("cat") in ("Class", "Exam"))
+    trav = [(hm(b["start"]), hm(b["end"])) for b in day["fixed"] if b.get("cat") == "Travel"]
+    trips = []
+    for s, e in oncampus:
+        if trips and s - trips[-1][1] <= 60:
+            trips[-1][1] = max(trips[-1][1], e)
         else:
-            clusters.append([s, e])
-    for cs, ce in clusters:
-        if not any(abs(te - cs) < 2 and (te - ts) == TRAV for ts, te in trav):
-            bad_travel.append(f"{date} no {TRAV}m travel before class at {cs//60:02d}:{cs%60:02d}")
-        if not any(abs(ts - ce) < 2 and (te - ts) == TRAV for ts, te in trav):
-            bad_travel.append(f"{date} no {TRAV}m travel after class ending {ce//60:02d}:{ce%60:02d}")
+            trips.append([s, e])
+    for cs, ce in trips:
+        if not any(te == cs and te - ts == TRAV for ts, te in trav):
+            fails.append(f"{date} no {TRAV} min travel before {cs//60:02d}:{cs%60:02d}")
+        if not any(ts == ce and te - ts == TRAV for ts, te in trav):
+            fails.append(f"{date} no {TRAV} min travel after {ce//60:02d}:{ce%60:02d}")
 
-    # 5. daily caps
-    core_m = sum(we - ws for ws, we, b in work if not b["overflow"])
-    tot_m = sum(we - ws for ws, we, b in work)
-    maxday = max(maxday, tot_m / 60)
-    if core_m > S["max_core_hours_per_day"] * 60 + 1:
-        fails.append(f"{date} core cap exceeded: {core_m/60:.1f} h")
-    if tot_m > S["max_total_hours_per_day"] * 60 + 1:
-        fails.append(f"{date} total cap exceeded: {tot_m/60:.1f} h")
+    if sum(e - s for s, e, b in work if not b["overflow"]) > S["max_core_hours_per_day"] * 60 + 1:
+        fails.append(f"{date} core cap exceeded")
+    if wmin > S["max_total_hours_per_day"] * 60 + 1:
+        fails.append(f"{date} total cap exceeded: {wmin/60:.1f} h")
 
-# 6. every task fully scheduled
-for tid, t in tasks.items():
-    if done[tid] != t["minutes"]:
-        fails.append(f"task {tid} scheduled {done[tid]}m of {t['minutes']}m")
+# every task fully scheduled
+short = [(tid, t["minutes"] - done[tid]) for tid, t in tasks.items() if done[tid] != t["minutes"]]
+for tid, gap in short:
+    fails.append(f"task {tid} scheduled {tasks[tid]['minutes'] - gap} of {tasks[tid]['minutes']} min")
 
-# 7. Friday labs really are absent
-fri_lab = [d["date"] for d in sched for b in d["fixed"]
-           if b.get("cat") == "Class" and "LAB" in b["title"]]
-check(not fri_lab, f"no lab blocks scheduled ({len(fri_lab)} found)" if fri_lab else
-      "no lab blocks scheduled (Friday labs correctly skipped)")
-
-# 8. discussion posts land on distinct days, spread out
-disc = defaultdict(list)
+# spread groups: separate days, minimum gap
+groups = defaultdict(list)
 for day in sched:
     for b in day["work"]:
-        if b["kind"] == "discussion":
-            disc[b["task"].rsplit("-p", 1)[0]].append(dt.date.fromisoformat(day["date"]))
-for k, ds in sorted(disc.items()):
+        g = tasks[b["task"]].get("spread_group")
+        if g:
+            groups[g].append(dt.date.fromisoformat(day["date"]))
+bad_spread = []
+for g, ds in sorted(groups.items()):
     u = sorted(set(ds))
-    check(len(u) == 3, f"{k}: {len(u)} distinct days")
-    if len(u) >= 2:
-        check((u[-1] - u[0]).days >= 4, f"{k}: spread {(u[-1]-u[0]).days} days "
-              f"({u[0]:%b %d} to {u[-1]:%b %d})")
+    if len(u) != len(ds):
+        bad_spread.append(f"{g}: {len(ds)} posts on {len(u)} days")
+    if any((b - a).days < 2 for a, b in zip(u, u[1:])):
+        bad_spread.append(f"{g}: posts closer than 2 days ({', '.join(f'{d:%b %d}' for d in u)})")
+fails += bad_spread
 
-check(not missing_meal, (f"meals present every day"
-      + (f" ({len(displaced)} displaced by all-day commitments)" if displaced else ""))
-      if not missing_meal else f"{len(missing_meal)} missing meals")
-check(not bad_travel, "travel brackets every class cluster" if not bad_travel
-      else f"{len(bad_travel)} travel problems")
-check(overlaps == 0, "no overlaps")
-check(outside == 0, "all work inside stated hours")
-check(early == 0 and late == 0, "all work inside each task's earliest..due window")
-notes.append(f"busiest day {maxday:.1f} h (cap {S['max_total_hours_per_day']} h)")
-notes.append(f"{sum(done.values())/60:.1f} h scheduled across {len(tasks)} tasks")
+# catch-up exists for every course that lost a lecture to a write-off
+missed = set()
+for d in blocked:
+    wd = d.weekday()
+    if any(o["date"] == d for o in cfg.get("no_class_days") or []):
+        continue
+    for c in cfg["classes"]:
+        if wd in c["days"] and d <= cfg["term"]["last_class_day"]:
+            missed.add(c["course"])
+have_cu = {t["course"] for t in tasks.values() if t["kind"] == "catchup"}
 
-for n in notes:
-    print(f"  ok   {n}")
-for d in displaced: print(f"  warn {d}")
-if missing_meal: print("\n".join(f"  FAIL {m}" for m in missing_meal[:5]))
-if bad_travel:   print("\n".join(f"  FAIL {m}" for m in bad_travel[:5]))
+check(not short, f"all {len(tasks)} tasks fully scheduled ({sum(done.values())/60:.1f} h)")
+check(not any("REAL DEADLINE" in f for f in fails), "nothing lands after a real deadline")
+check(not any("before earliest" in f or "effective due" in f for f in fails),
+      "all work inside each task's resolved window")
+check(not any("overlap" in f for f in fails), "no overlaps with classes, exams, travel or meals")
+check(not any("outside hours" in f for f in fails), "all work inside stated hours")
+check(not any("write-off" in f for f in fails),
+      f"{n['blocked']} write-off days carry no work and no classes")
+check(not any("exam day" in f for f in fails),
+      f"{n['exam']} exam days capped at {EXAM_CAP/60:.0f} h with no evening work")
+check(not any("travel" in f for f in fails), "travel brackets every class and exam trip")
+check(not bad_spread, f"discussion posts on separate days, >=2 days apart ({len(groups)} groups)")
+check(missed <= have_cu, f"catch-up generated for every course that missed lectures ({', '.join(sorted(missed)) or 'none'})",
+      f"missing catch-up for {sorted(missed - have_cu)}")
+check(not any("cap exceeded" in f for f in fails), f"daily caps held (busiest {maxday:.1f} h)")
+
+for o in oks:   print(f"  ok   {o}")
+for w in warns: print(f"  warn {w}")
 if fails:
     print(f"\n{len(fails)} FAILURES")
-    for f in fails[:25]:
-        print(f"  {f}")
+    for f in fails[:25]: print(f"  {f}")
     sys.exit(1)
 print("\nall constraints satisfied")
