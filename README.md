@@ -7,7 +7,6 @@ constraint and re-running reflows everything predictably.
 ```bash
 uv run plan.py                  # replan + render
 uv run verify.py                # check the result against every stated constraint
-uv run plan.py --from 2026-10-08   # freeze the past, replan from a date
 ```
 
 ## Files
@@ -15,8 +14,9 @@ uv run plan.py --from 2026-10-08   # freeze the past, replan from a date
 | File | What it is |
 |---|---|
 | `config.yaml` | Constraints: work hours, meals, travel, classes, term dates |
-| `tasks.yaml` | The 84 work items with hours, earliest-start and due |
+| `tasks.yaml` | The 94 work items with hours, earliest-start and due |
 | `events.yaml` | **Ad-hoc commitments — the file that changes** |
+| `progress.yaml` | What is done: last day accounted for, minutes completed per task |
 | `plan.py` | The scheduler and HTML renderer |
 | `verify.py` | Independent constraint checker; exits non-zero on violation |
 | `calendar.html` | Week-grid view, Google-Calendar style |
@@ -31,6 +31,8 @@ translations are mechanical:
 | You say | What changes |
 |---|---|
 | "I have a thing Thursday 6–9pm" | a row in `events.yaml` |
+| "I didn't do anything today" | `through:` in `progress.yaml` moves to today |
+| "I got 2 h of the MATH 3240 assignment done" | `math3240-a1: 120` under `done:`, and `through:` |
 | "no weekends" | `work_hours.include_weekends: false` |
 | "I can work till 11 on weeknights" | `work_hours.overflow` |
 | "CIS 4020's project is a group project, halve it" | the `minutes` on `cis4020-proj` |
@@ -127,10 +129,11 @@ Gotchas for option 1:
 - Key every synced event on a stable id (task id + session index) so a re-sync updates or deletes
   events instead of duplicating them.
 
-The planner has no record of work actually done. `--from DATE` reschedules every task's full
-minutes from that date, so a live calendar drifts from reality after the first skipped block. A
-progress log (minutes done per task, subtracted before scheduling) is a prerequisite for
-maintaining any real calendar mid-term.
+A live calendar also needs the plan to know what actually got done, or it drifts after the first
+skipped block. `progress.yaml` covers that: planning starts the day after `through`, logged
+minutes come off each task, and anything the plan had put before then that is not logged is
+rescheduled. Work whose deadline has already passed is scheduled as soon as it physically can
+be, and `verify.py` reports it as overdue instead of failing.
 
 Sources: [Calendar API scopes](https://developers.google.com/workspace/calendar/api/auth),
 [Calendars: insert](https://developers.google.com/workspace/calendar/api/v3/reference/calendars/insert),
@@ -139,11 +142,16 @@ Sources: [Calendar API scopes](https://developers.google.com/workspace/calendar/
 
 ## Current state
 
-394.8 h across 77 working days with Oct 5–10 written off and **hand-ins finishing 3 days
+Progress logged through Mon Sep 21 with nothing done, so the plan runs from Tue Sep 22:
+394.8 h across 76 working days with Oct 5–10 written off and **hand-ins finishing 3 days
 early** (adopted 2026-09-21). Every one of the 23 hand-ins lands at least 3 days before its
-real deadline; the median is 5 days and the pre-trip items get 9–11. Cost: 10.6 h of evening
-work across the term, busiest day 8.2 h. `verify.py` checks the buffer directly and passes
-every check.
+real deadline; the median is 4 days. Cost: 14.6 h of evening work across the term, busiest
+day 8.2 h (Thu Nov 19). `verify.py` checks the buffer directly and passes every check.
+
+Losing Monday (2.8 h) cost 4 h of evenings, all on Thu Oct 22 (CIS*3210 midterm prep between
+the Oct 21 midterms and the Oct 24 one). The late-September class days are already full in core
+hours, and the scheduler only opens evenings for work that is pressed, so the slip surfaces in
+the post-trip crunch rather than this week. ENVS Reading wk1 is one day overdue and runs Tue.
 
 On the calendar, ⚑ flags sit on each hand-in's **real** deadline, so the gap between the
 last work block and the flag is the buffer.

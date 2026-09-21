@@ -8,7 +8,8 @@
 
 Windows are checked against resolved_tasks.json (the planner's effective windows
 after unavailability is applied) AND against each task's original due date, which
-is the hard limit no adjustment may cross.
+is the hard limit no adjustment may cross. The one exception is work already overdue
+when the plan starts: it is reported, since no schedule can put it back in time.
 """
 import datetime as dt, json, sys
 from collections import defaultdict
@@ -19,6 +20,8 @@ HERE = Path(__file__).parent
 cfg = yaml.safe_load((HERE / "config.yaml").read_text())
 tasks = {t["id"]: t for t in json.loads((HERE / "resolved_tasks.json").read_text())}
 sched = json.loads((HERE / "schedule.json").read_text())
+progress = yaml.safe_load((HERE / "progress.yaml").read_text())
+START = max(cfg["term"]["start"], progress["through"] + dt.timedelta(days=1))
 hm = lambda s: int(s[:2]) * 60 + int(s[3:])
 dtm = lambda s: dt.datetime.strptime(s, "%Y-%m-%d %H:%M")
 
@@ -44,6 +47,8 @@ maxday = 0.0
 
 for day in sched:
     date = dt.date.fromisoformat(day["date"])
+    if date < START and day["work"]:
+        fails.append(f"{date} is before the plan start {START} but carries work")
     fixed = [(hm(b["start"]), hm(b["end"]), b) for b in day["fixed"]]
     work = [(hm(b["start"]), hm(b["end"]), b) for b in day["work"]]
     wmin = sum(e - s for s, e, _ in work)
@@ -73,7 +78,7 @@ for day in sched:
             fails.append(f"{date} before earliest: {wb['title']}")
         if end > dtm(t["due"]):
             fails.append(f"{date} after effective due: {wb['title']} (due {t['due']})")
-        if end > dtm(t["orig_due"]):
+        if end > dtm(t["orig_due"]) and not t["overdue"]:
             fails.append(f"{date} AFTER REAL DEADLINE: {wb['title']} (due {t['orig_due']})")
         done[wb["task"]] += we - ws
     for i in range(len(work)):
@@ -129,10 +134,15 @@ for day in sched:
     if wmin > S["max_total_hours_per_day"] * 60 + 1:
         fails.append(f"{date} total cap exceeded: {wmin/60:.1f} h")
 
-# every task fully scheduled
-short = [(tid, t["minutes"] - done[tid]) for tid, t in tasks.items() if done[tid] != t["minutes"]]
-for tid, gap in short:
-    fails.append(f"task {tid} scheduled {tasks[tid]['minutes'] - gap} of {tasks[tid]['minutes']} min")
+# every task's remaining minutes fully scheduled
+owed = {tid: t["minutes"] - t["done"] for tid, t in tasks.items()}
+short = [tid for tid in tasks if done[tid] != owed[tid]]
+for tid in short:
+    fails.append(f"task {tid} scheduled {done[tid]} of {owed[tid]} min still owed")
+for tid, t in tasks.items():
+    if t["overdue"]:
+        warns.append(f"overdue: {t['course']} {t['title']} was due {t['orig_due']}, "
+                     f"now finishing by {t['due']}")
 
 # spread groups: separate days, minimum gap
 groups = defaultdict(list)
@@ -162,6 +172,9 @@ for d in blocked:
 have_cu = {t["course"] for t in tasks.values() if t["kind"] == "catchup"}
 
 check(not short, f"all {len(tasks)} tasks fully scheduled ({sum(done.values())/60:.1f} h)")
+check(not any("before the plan start" in f for f in fails),
+      f"nothing scheduled before {START:%a %b %d} (progress logged through "
+      f"{progress['through']:%a %b %d})")
 check(not any("REAL DEADLINE" in f for f in fails), "nothing lands after a real deadline")
 check(not any("before earliest" in f or "effective due" in f for f in fails),
       "all work inside each task's resolved window")
@@ -186,7 +199,7 @@ if EF:
             last[b["task"]] = max(last.get(b["task"], day["date"]), day["date"])
     short_buf = []
     for tid, tk in tasks.items():
-        if tk["kind"] not in set(ef.get("kinds", ["work"])) or tid not in last:
+        if tk["kind"] not in set(ef.get("kinds", ["work"])) or tid not in last or tk["overdue"]:
             continue
         real = dtm(tk["orig_due"]).date()
         if EF_FROM and real < EF_FROM:

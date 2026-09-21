@@ -5,18 +5,17 @@
 """Time-block every Fall 2026 deliverable across the term.
 
 Reads  config.yaml (constraints) · tasks.yaml (work) · events.yaml (ad-hoc commitments)
+       progress.yaml (what is done, and the last day accounted for)
 Writes schedule.json (machine-readable) · calendar.html (week grids)
 
     uv run plan.py                 # replan and render
-    uv run plan.py --from 2026-10-08   # freeze the past, replan from a date
 
 Rescheduling is not incremental: the planner is deterministic, so adding an event
-to events.yaml and re-running reflows everything around it. Use --from to keep
-already-completed days fixed.
+to events.yaml and re-running reflows everything around it. Planning starts the day
+after progress.yaml's `through`, with logged minutes taken off each task.
 """
 from __future__ import annotations
 
-import argparse
 import datetime as dt
 import json
 import math
@@ -210,6 +209,20 @@ class Day:
         return sum(b["end"] - b["start"] for b in self.blocks if b["overflow"] is overflow)
 
 
+# ---------- progress ---------------------------------------------------------
+def apply_progress(cfg: dict, tasks: list[dict], progress: dict):
+    """Take logged minutes off each task and drop what is finished.
+    Returns the tasks still owed and the first day to plan."""
+    done = progress.get("done") or {}
+    unknown = set(done) - {t["id"] for t in tasks}
+    if unknown:
+        raise SystemExit(f"progress.yaml: unknown task ids {sorted(unknown)}")
+    for t in tasks:
+        t["_done"] = min(int(done.get(t["id"], 0)), t["minutes"])
+    start = max(cfg["term"]["start"], progress["through"] + dt.timedelta(days=1))
+    return [t for t in tasks if t["_done"] < t["minutes"]], start
+
+
 # ---------- task preparation -------------------------------------------------
 def prepare(cfg: dict, tasks: list[dict], blocked: dict, start_from: dt.date):
     """Resolve each task's real window against the days actually available.
@@ -222,6 +235,17 @@ def prepare(cfg: dict, tasks: list[dict], blocked: dict, start_from: dt.date):
             d -= dt.timedelta(days=1)
         return d
 
+    def soonest_finish(start: dt.date, minutes: int) -> dt.datetime:
+        """The earliest a task could be done if begun on `start`, at ~5 h a day."""
+        need, d = max(1, math.ceil(minutes / 300)), start
+        while not avail(d):
+            d += dt.timedelta(days=1)
+        while need > 1:
+            d += dt.timedelta(days=1)
+            if avail(d):
+                need -= 1
+        return dt.datetime.combine(d, dt.time(22, 0))
+
     for t in tasks:
         t["_orig_due"] = dt.datetime.strptime(t["due"], "%Y-%m-%d %H:%M")
         t["_due"] = t["_orig_due"]
@@ -233,6 +257,14 @@ def prepare(cfg: dict, tasks: list[dict], blocked: dict, start_from: dt.date):
             t["_due"] = dt.datetime.combine(d, dt.time(22, 0))
             changes.append(f"{t['course']} {t['title']}: finish by {d:%a %b %d} "
                            f"(really due {t['_orig_due']:%a %b %d})")
+
+        # work still owed after its deadline has passed: finish it as soon as possible
+        if t["_due"].date() < start_from:
+            t["_overdue"] = True
+            t["_earliest"] = start_from
+            t["_due"] = soonest_finish(start_from, t["minutes"] - t["_done"])
+            changes.append(f"{t['course']} {t['title']}: overdue (was due "
+                           f"{t['_orig_due']:%a %b %d}), now by {t['_due']:%a %b %d}")
 
         # a window that is now empty opens up the week before
         if t["_earliest"] > t["_due"].date():
@@ -248,7 +280,7 @@ def prepare(cfg: dict, tasks: list[dict], blocked: dict, start_from: dt.date):
     ef_from = ef.get("from")
     if N:
         for t in tasks:
-            if t["kind"] not in kinds:
+            if t["kind"] not in kinds or t.get("_overdue"):
                 continue
             if ef_from and t["_orig_due"].date() < ef_from:
                 continue
@@ -256,14 +288,8 @@ def prepare(cfg: dict, tasks: list[dict], blocked: dict, start_from: dt.date):
             if target.date() in blocked:
                 target = dt.datetime.combine(last_avail_on_or_before(target.date()),
                                              dt.time(22, 0))
-            need, d = max(1, math.ceil(t["minutes"] / 300)), t["_earliest"]
-            while not avail(d):                  # can't start on a blocked day
-                d += dt.timedelta(days=1)
-            while need > 1:                      # earliest it could possibly finish
-                d += dt.timedelta(days=1)
-                if avail(d):
-                    need -= 1
-            floor = dt.datetime.combine(d, dt.time(22, 0))
+            floor = soonest_finish(max(t["_earliest"], start_from),
+                                   t["minutes"] - t["_done"])
             new = max(target, floor)
             if new < t["_due"]:
                 t["_due"] = new
@@ -301,7 +327,7 @@ def prepare(cfg: dict, tasks: list[dict], blocked: dict, start_from: dt.date):
             "id": f"catchup-{course.lower()}", "course": course,
             "title": f"Catch up {len(dates)} missed lectures", "minutes": len(dates) * per,
             "earliest": str(back), "due": f"{due:%Y-%m-%d %H:%M}", "kind": "catchup",
-            "min_minutes": 60, "max_minutes": 180,
+            "min_minutes": 60, "max_minutes": 180, "_done": 0,
             "note": "missed " + ", ".join(f"{d:%a %b %d}" for d in dates),
             "_earliest": back, "_due": due, "_orig_due": due,
         })
@@ -332,7 +358,7 @@ def schedule(cfg: dict, tasks: list[dict], events: list[dict], start_from: dt.da
     exam_cap = int(S.get("exam_day_max_hours", S["max_total_hours_per_day"]) * 60)
 
     for t in tasks:
-        t["remaining"] = t["minutes"]
+        t["remaining"] = t["minutes"] - t["_done"]
 
     def latest_start(t, today):
         """Latest date this task can begin and still finish at ~5 h/day,
@@ -543,7 +569,8 @@ def render(days, unplaced, cfg, tasks) -> str:
     out.append('<header><h1>Fall 2026 — time-blocked plan</h1>'
                f'<div class="sub">{len(tasks)} tasks · {total/60:.0f} h scheduled '
                f'({of/60:.0f} h in evening overflow) · '
-               f'{days[0].date:%b %d} – {days[-1].date:%b %d}'
+               f'{days[0].date:%a %b %d} – {days[-1].date:%b %d} '
+               f'(progress logged through {days[0].date - dt.timedelta(days=1):%a %b %d})'
                + (f' · hand-ins finish <b>{ef_days} days</b> before their real deadline (⚑)'
                   if ef_days else "") + '</div>'
                '<div class="legend">'
@@ -623,21 +650,18 @@ def render(days, unplaced, cfg, tasks) -> str:
 
 # ---------- entry ------------------------------------------------------------
 def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--from", dest="start", default=None,
-                    help="replan from this date, leaving earlier days alone")
-    args = ap.parse_args()
-
     cfg = yaml.safe_load((HERE / "config.yaml").read_text())
     tasks = yaml.safe_load((HERE / "tasks.yaml").read_text())["tasks"]
     events = (yaml.safe_load((HERE / "events.yaml").read_text()) or {}).get("events") or []
+    progress = yaml.safe_load((HERE / "progress.yaml").read_text())
 
-    start_from = dt.date.fromisoformat(args.start) if args.start else cfg["term"]["start"]
+    tasks, start_from = apply_progress(cfg, tasks, progress)
     days, unplaced, tasks, changes = schedule(cfg, tasks, events, start_from)
 
     (HERE / "calendar.html").write_text(render(days, unplaced, cfg, tasks))
     (HERE / "resolved_tasks.json").write_text(json.dumps([{
         "id": t["id"], "course": t["course"], "title": t["title"], "minutes": t["minutes"],
+        "done": t["_done"], "overdue": bool(t.get("_overdue")),
         "kind": t["kind"], "earliest": str(t["_earliest"]),
         "due": f"{t['_due']:%Y-%m-%d %H:%M}", "orig_due": f"{t['_orig_due']:%Y-%m-%d %H:%M}",
         "spread_group": t.get("spread_group"), "note": t.get("note", ""),
@@ -650,13 +674,14 @@ def main() -> None:
     } for d in days], indent=1))
 
     if changes:
-        print("adjusted for unavailability:")
+        print("adjusted:")
         for c in changes:
             print(f"  · {c}")
     tot = sum(sum(b["end"] - b["start"] for b in d.blocks) for d in days)
     ovf = sum(d.worked(True) for d in days)
     busiest = max(days, key=lambda d: d.worked())
-    print(f"scheduled {tot/60:.1f} h of {sum(t['minutes'] for t in tasks)/60:.1f} h "
+    print(f"planning from {days[0].date:%a %b %d} (progress through {progress['through']:%a %b %d})")
+    print(f"scheduled {tot/60:.1f} h of {sum(t['minutes'] - t['_done'] for t in tasks)/60:.1f} h "
           f"across {sum(1 for d in days if d.blocks)} working days")
     print(f"  overflow (after 17:00): {ovf/60:.1f} h")
     print(f"  busiest day: {busiest.date:%a %b %d} at {busiest.worked()/60:.1f} h")
