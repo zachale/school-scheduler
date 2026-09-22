@@ -118,7 +118,7 @@ def _batch(svc, calls: list, label: str) -> None:
     """Run request factories in batches. Rate limits and server errors are retried with
     backoff; a delete of an event that is already gone, and an insert of one that already
     exists (the same write, retried), both resolve without duplicating anything."""
-    pending, delay = list(calls), 2
+    pending, delay, solo = list(calls), 2, []
     for _ in range(RETRIES):
         retry = []
         for i in range(0, len(pending), BATCH):
@@ -136,18 +136,29 @@ def _batch(svc, calls: list, label: str) -> None:
                 status, reason = exc.resp.status, _reason(exc)
                 if call["kind"] == "delete" and status in (404, 410):
                     continue
-                if call["kind"] == "insert" and status == 409 and call.get("instead"):
-                    retry.append({"make": call["instead"], "kind": "update"})
+                if status == 409:
+                    # a conflict inside a batch (an id that already exists, often a deleted
+                    # event being brought back) goes through on its own, one call at a time
+                    solo.append(call)
                 elif status in (429, 500, 502, 503) or (status == 403 and reason in RETRY_REASONS):
                     retry.append(call)
                 else:
                     raise CalendarError(f"{label}: {status} {reason or exc}")
         if not retry:
-            return
+            break
         pending = retry
         time.sleep(delay)
         delay = min(delay * 2, 30)
-    raise CalendarError(f"{label}: {len(pending)} writes still failing after retries")
+    else:
+        raise CalendarError(f"{label}: {len(pending)} writes still failing after retries")
+    for call in solo:
+        try:
+            call["make"]().execute(num_retries=RETRIES)
+        except HttpError as e:
+            if e.resp.status == 409 and call.get("instead"):
+                call["instead"]().execute(num_retries=RETRIES)   # the event exists: update it
+            elif not (call["kind"] == "delete" and e.resp.status in (404, 410)):
+                raise CalendarError(f"{label}: {e.resp.status} {_reason(e) or e}") from e
 
 
 def apply(svc, cid: str, want: dict[str, dict], since: dt.date, dry_run: bool) -> tuple:
