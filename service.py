@@ -166,6 +166,10 @@ def planner_state(db, now: dt.datetime) -> dict:
     for r in db.execute("select * from sessions where status = 'done'"):
         done[r["task"]] = done.get(r["task"], 0) + r["planned_min"]
         last[r["task"]] = max(last.get(r["task"], r["date"]), r["date"])
+    # a task finished through its row, with no block of its own, dates from that row
+    # (discussion-post spacing counts from it)
+    for r in db.execute("select task, day from finished"):
+        last.setdefault(r["task"], r["day"])
     # wrap-up minutes already spent or under way, so the 30-minute allowance is given once
     for r in db.execute("select * from sessions where status in ('done', 'missed', 'planned')"):
         if not json.loads(r["block"]).get("wrapup"):
@@ -205,7 +209,7 @@ def fingerprint(busy: list[dict], state: dict) -> str:
     h.update(json.dumps(busy, sort_keys=True).encode())
     # what the plan depends on besides the inputs: the day, and which sessions are history
     h.update(json.dumps({k: state[k] for k in ("done", "finished", "dropped", "late_ok",
-                                               "wrapped", "multiplier")},
+                                               "wrapped", "multiplier", "last_done")},
                         sort_keys=True).encode())
     h.update(state["now"][:10].encode())
     return h.hexdigest()
