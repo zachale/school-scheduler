@@ -49,7 +49,7 @@ service replans within a minute. The translations are mechanical:
 | "make this block shorter" | resize it (same start): it keeps that length, and the planner may still move it |
 | "I'll do this block then" | drag it to a new start: it is locked there and never moved again |
 | "I handed it in" | tick the deliverable row; its remaining blocks are cancelled |
-| "I didn't do today's blocks" | nothing: a block still unticked when the day ends becomes Missed and its time is planned again |
+| "I didn't do today's blocks" | nothing: a block still unticked when the day ends becomes Missed and its time is planned again. A Missed block stays on its slot; resizing it only changes the time it records if you tick it later |
 | "drop this task" | delete its row in Could Do; restoring it from the trash brings it back |
 | "keep working on it after the deadline" | set its Plan state to Late OK |
 | "no weekends" | `work_hours.include_weekends: false` |

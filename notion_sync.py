@@ -162,18 +162,21 @@ def _session_change(db, row, sid, was_done, now, grace, bot, known_row) -> None:
     if edited:
         size = int((end - start).total_seconds() // 60)
         moved = f"{start:%Y-%m-%dT%H:%M}" != written[0]
+        _set_times(db, sid, start, end)
+        # the size he gave it, and a start he chose, stand even if he unticks it later,
+        # including when the tick and the drag reach this scan together
+        db.execute("update sessions set user_min = ?, locked = max(locked, ?) where id = ?",
+                   (size, int(moved), sid))
         if s["status"] == "done" or row["done"]:
-            _set_times(db, sid, start, end)       # his record of when it really happened
             db.execute("update sessions set measured = 1 where id = ?", (sid,))
             log(f"edited: {sid} now {start:%a %H:%M}-{end:%H:%M} ({size} min)")
         elif moved:
-            _set_times(db, sid, start, end)
-            db.execute("update sessions set status = 'planned', locked = 1, user_min = ? "
-                       "where id = ?", (size, sid))
+            db.execute("update sessions set status = 'planned' where id = ?", (sid,))
             log(f"moved: {sid} locked at {start:%a %H:%M}-{end:%H:%M}")
+        elif s["status"] == "missed":
+            # its time was already planned again; the new size is what it records if ticked
+            log(f"resized: missed block {sid} is now {size} min, counted only if ticked")
         else:
-            _set_times(db, sid, start, end)
-            db.execute("update sessions set user_min = ? where id = ?", (size, sid))
             log(f"resized: {sid} is now {size} min")
         db.execute("update rows set w_start = ?, w_end = ? where plan_id = ?",
                    (f"{start:%Y-%m-%dT%H:%M}", f"{end:%Y-%m-%dT%H:%M}", f"session:{sid}"))
@@ -267,6 +270,23 @@ def state(db) -> dict:
 
 
 # ---------- writing ----------------------------------------------------------
+def _edited_since_scan(nt: notion.Notion, row: dict) -> bool:
+    """Whether Zach changed a block row after this cycle's scan. Writing it now would put
+    back the old times and make the service its last editor, so his edit would never be
+    read; left alone, the next cycle reads it. Notion has no conditional update, so this
+    reads the row just before writing it."""
+    live = nt.get(row["page_id"])
+    if live is None:
+        return True                               # trashed meanwhile: the next scan sees it
+    start, end = _local(live["start"]), _local(live["end"])
+    shown = (start and f"{start:%Y-%m-%dT%H:%M}", end and f"{end:%Y-%m-%dT%H:%M}")
+    changed = shown != (row["w_start"], row["w_end"]) or live["done"] != bool(row["done"])
+    if changed and live["edited_by"] != nt.me():
+        log(f"{row['plan_id']} changed in Notion during this cycle; the next one reads it")
+        return True
+    return False
+
+
 def write(db, nt: notion.Notion, cfg: dict, resolved: list[dict], now: dt.datetime) -> tuple:
     """Make Could Do hold a row for every task and every planned block."""
     tags = cfg["notion"]["course_tags"]
@@ -354,6 +374,8 @@ def write(db, nt: notion.Notion, cfg: dict, resolved: list[dict], now: dt.dateti
             remember(plan_id, nt.create(props), props, times)
             added += 1
         elif row["hash"] != _hash(props) or (row["w_start"], row["w_end"]) != times:
+            if _edited_since_scan(nt, row):
+                continue
             nt.update(row["page_id"], props)
             remember(plan_id, row["page_id"], props, times)
             updated += 1
@@ -374,6 +396,8 @@ def write(db, nt: notion.Notion, cfg: dict, resolved: list[dict], now: dt.dateti
         row = known.get(plan_id)
         times = _times(s_)
         if row is None or (row["done"] and (row["w_start"], row["w_end"]) == times):
+            continue
+        if _edited_since_scan(nt, row):
             continue
         start, end = (dt.datetime.fromisoformat(t) for t in times)
         nt.update(row["page_id"], {"Done": {"checkbox": True}, "Due Date": date_range(start, end)})

@@ -71,7 +71,10 @@ for day in sched:
                 done[wb["task"]] += we - ws
         elif dt.datetime.combine(date, dt.time(ws // 60, ws % 60)) < NOW:
             fails.append(f"{date} {wb['start']} {wb['title']} is before the plan start {NOW}")
-    work = [x for x in allwork if not x[2].get("pinned")]   # judged against today's rules
+    # judged against today's rules: what the planner added. Work under way and blocks Zach
+    # placed (both pinned) count toward a day's totals, but a day they alone fill past a cap
+    # is his call; the planner fails a cap only by adding to it
+    work = [x for x in allwork if not x[2].get("pinned")]
     wmin = sum(e - s for s, e, _ in allwork)
     maxday = max(maxday, wmin / 60)
 
@@ -141,7 +144,7 @@ for day in sched:
     # exam days: lighter, and nothing in the evening
     if any(b.get("cat") == "Exam" for _, _, b in fixed):
         n["exam"] += 1
-        if wmin > EXAM_CAP + 1:
+        if work and wmin > EXAM_CAP + 1:
             fails.append(f"{date} exam day carries {wmin/60:.1f} h (cap {EXAM_CAP/60:.1f})")
         if any(b["overflow"] for _, _, b in work):
             fails.append(f"{date} exam day runs into the evening")
@@ -181,13 +184,10 @@ for day in sched:
         if not any(ts == ce and te - ts == TRAV for ts, te in trav):
             fails.append(f"{date} no {TRAV} min travel after {ce//60:02d}:{ce%60:02d}")
 
-    # a day he filled past the cap himself is his call; the planner may not add to it
-    planner_work = any(not b.get("locked") for _, _, b in allwork)
-    if planner_work and sum(e - s for s, e, b in allwork if not b["overflow"]) > \
-            S["max_core_hours_per_day"] * 60 + 1 and any(not b.get("locked") and not b["overflow"]
-                                                         for _, _, b in allwork):
+    if any(not b["overflow"] for _, _, b in work) and \
+            sum(e - s for s, e, b in allwork if not b["overflow"]) > S["max_core_hours_per_day"] * 60 + 1:
         fails.append(f"{date} core cap exceeded")
-    if planner_work and wmin > S["max_total_hours_per_day"] * 60 + 1:
+    if work and wmin > S["max_total_hours_per_day"] * 60 + 1:
         fails.append(f"{date} total cap exceeded: {wmin/60:.1f} h")
 
 # every task's remaining minutes fully scheduled
