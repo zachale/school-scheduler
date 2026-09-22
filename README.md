@@ -161,6 +161,27 @@ Sources: [Calendars: insert](https://developers.google.com/workspace/calendar/ap
 [ICS refresh rates](https://calfeed.ai/learn/ics-refresh-rate-apple-google),
 [7-day testing tokens](https://dev.to/ko-hi/googles-oauth-testing-mode-expires-refresh-tokens-in-7-days-publish-the-consent-screen-before-24hm).
 
+## Mapping to Notion `Could Do`
+
+Checked 2026-09-21 with `notion_map.py` against a snapshot of the 71 F26 rows
+(`notion_rows.tsv`). It is **not 1:1**, but every row and every task is accounted for:
+
+| Relationship | Notion rows | Planner tasks |
+|---|---:|---:|
+| 1:1 — hand-ins, ENVS weekly readings, Respondus practice | 35 | 35 |
+| 1:1 — exam row ↔ its prep task (5 midterms, 4 finals) | 9 | 9 |
+| 1:3 — ENVS discussion ↔ its three posts | 5 | 15 |
+| 1:2 — ENVS midterm ↔ prep + sitting the 24 h window | 2 | 4 |
+| Notion only — CIS*3210 in-lecture quizzes (no prep scheduled) | 20 | 0 |
+| Planner only — weekly reviews/practice, CIS*4020 project analysis | 0 | 31 |
+| **Total** | **71** | **94** |
+
+The generated catch-up tasks (one per course after the Oct 5–10 write-off) have no Notion
+row either. Deadlines agree on every mapped pair except three, two of them deliberate: ENVS
+midterm prep and sitting are planned for the window's first day, not its close, and the
+CIS*4020 presentation is prepared by the Nov 24 start of its window. The one real
+disagreement is ENVS week 1 reading: Notion ends it Sun Sep 20, the planner Mon Sep 21.
+
 ## Current state
 
 Progress logged through Mon Sep 21 with nothing done, so the plan runs from Tue Sep 22:
