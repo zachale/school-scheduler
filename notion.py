@@ -50,16 +50,20 @@ class Notion:
         self._me: str | None = None
 
     # ---- transport
-    def call(self, method: str, path: str, body: dict | None = None) -> dict:
+    def call(self, method: str, path: str, body: dict | None = None,
+             idempotent: bool = True) -> dict:
+        """One API call. A 429 was never processed, so it is always retried; a timeout or
+        a 5xx may already have been saved, so a create is not retried after one: the next
+        cycle's scan finds the row if it was made."""
         for attempt in range(RETRIES):
             try:
                 r = self.session.request(method, f"{API}{path}", json=body, timeout=30)
             except requests.RequestException as e:
-                if attempt == RETRIES - 1:
+                if attempt == RETRIES - 1 or not idempotent:
                     raise NotionError(f"{method} {path}: {e}") from e
                 time.sleep(2 ** attempt)
                 continue
-            if r.status_code == 429 or r.status_code >= 500:
+            if r.status_code == 429 or (r.status_code >= 500 and idempotent):
                 if attempt == RETRIES - 1:
                     raise NotionError(f"{method} {path}: {r.status_code} {r.text[:200]}")
                 time.sleep(float(r.headers.get("Retry-After", 2 ** attempt)))
@@ -76,8 +80,17 @@ class Notion:
         return self._me
 
     # ---- reading
-    def scan(self) -> dict[str, dict]:
-        """Every row carrying a Plan ID, by Plan ID. One pass, a few requests."""
+    def check_schema(self) -> None:
+        """Fail the cycle, rather than misread every row, if a column was renamed."""
+        props = self.call("GET", f"/data_sources/{self.ds}")["properties"]
+        missing = [p for p in ("Name", "Done", "Plan ID", "Due Date", "Planned min", "Actual min",
+                               "Plan state", "Parent item", "Tags") if p not in props]
+        if missing:
+            raise NotionError(f"Could Do is missing {missing}; was a column renamed?")
+
+    def scan(self) -> dict[str, list[dict]]:
+        """Every row carrying a Plan ID, grouped by Plan ID (Notion's Duplicate can make two).
+        One pass, a few requests."""
         out, cursor = {}, None
         while True:
             body = {"page_size": PAGE_SIZE,
@@ -88,7 +101,7 @@ class Notion:
             for page in res["results"]:
                 row = parse_row(page)
                 if row["plan_id"]:
-                    out[row["plan_id"]] = row
+                    out.setdefault(row["plan_id"], []).append(row)
             cursor = res.get("next_cursor")
             if not res.get("has_more"):
                 return out
@@ -102,7 +115,8 @@ class Notion:
     def create(self, props: dict, parent_page: str | None = None) -> str:
         parent = ({"type": "page_id", "page_id": parent_page} if parent_page
                   else {"type": "data_source_id", "data_source_id": self.ds})
-        return self.call("POST", "/pages", {"parent": parent, "properties": props})["id"]
+        return self.call("POST", "/pages", {"parent": parent, "properties": props},
+                         idempotent=False)["id"]
 
     def update(self, page_id: str, props: dict) -> None:
         self.call("PATCH", f"/pages/{page_id}", {"properties": props})

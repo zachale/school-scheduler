@@ -8,14 +8,17 @@ drag a correct multiplier back towards 1.
 
     multiplier = (sum actual + 2·mean estimate) / (sum estimate + 2·mean estimate)
 
-The two phantom on-estimate tasks keep one odd result from swinging the plan; the result
-is clamped to 0.5–2×. A course with fewer than two finished assignments borrows the
-all-assignments figure.
+Guards against one odd task moving the plan: each task's own ratio is clamped to 0.5–2×
+before it counts, the two phantom on-estimate tasks damp the rest, a group needs at least
+two finished tasks before its multiplier is used at all, and the result is clamped to
+0.5–2×. A course with fewer than two finished assignments borrows the all-assignments
+figure, once that has two tasks behind it.
 """
 from __future__ import annotations
 
 PRIOR = 2
 LO, HI = 0.5, 2.0
+MIN_TASKS = 2                 # finished tasks a group needs before its multiplier is used
 MIN_MEASURED = 0.5            # share of a task's blocks (by planned minutes) that must be measured
 READ_WPM, READ_BUFFER = 220, 1.3   # how the reading estimates were built
 
@@ -45,17 +48,18 @@ def evidence(db, resolved: list[dict], base: dict[str, int]) -> dict[str, list[t
 
 def multipliers(ev: dict[str, list[tuple]]) -> dict[str, float]:
     def fit(pairs):
-        a = sum(p[0] for p in pairs)
+        # one outlier task (handed in after a single block, say) counts as at most 2x off
+        a = sum(min(HI, max(LO, p[0] / p[1])) * p[1] for p in pairs)
         e = sum(p[1] for p in pairs)
         ebar = e / len(pairs)
         return min(HI, max(LO, (a + PRIOR * ebar) / (e + PRIOR * ebar)))
-    out = {g: fit(p) for g, p in ev.items() if p}
+    out = {g: fit(p) for g, p in ev.items() if len(p) >= MIN_TASKS}
     work = [p for g, ps in ev.items() if g.startswith("work:") for p in ps]
-    if work:
+    if len(work) >= MIN_TASKS:
         out["work"] = fit(work)
-    for g, ps in ev.items():                  # thin evidence for one course: use all courses
-        if g.startswith("work:") and len(ps) < 2:
-            out[g] = out["work"]
+        for g, ps in ev.items():              # thin evidence for one course: use all courses
+            if g.startswith("work:") and len(ps) < MIN_TASKS:
+                out[g] = out["work"]
     return out
 
 
@@ -77,9 +81,11 @@ def report(ev: dict[str, list[tuple]], mult: dict[str, float], tasks: list[dict]
     names = {"reading": "Readings", "discussion": "Discussion posts",
              "ongoing": "Weekly reviews and practice", "prep": "Exam prep"}
     lines = []
-    if not ev:
-        return ["Nothing measured yet. Check a block off in Could Do while you are in it, or "
-                "fill in Actual min, and finished tasks start teaching the planner your pace."]
+    if not mult:
+        n = sum(len(p) for p in ev.values())
+        return [f"Measured so far: {n} finished task{'s' if n != 1 else ''}. Each kind of work "
+                f"needs {MIN_TASKS} before the planner changes its estimates.",
+                "Check a block off in Could Do while you are in it, or fill in Actual min."]
     for g in sorted(mult):
         if g == "work":
             continue
@@ -90,7 +96,7 @@ def report(ev: dict[str, list[tuple]], mult: dict[str, float], tasks: list[dict]
         if g == "reading":
             line += f" — about {READ_WPM / (READ_BUFFER * mult[g]):.0f} words a minute"
         lines.append(line)
-    shift = sum(round(t["minutes"] * (m - 1)) for t in tasks
+    shift = sum(round(t.get("base_minutes", t["minutes"]) * (m - 1)) for t in tasks
                 for m in [per_task([t], mult, started).get(t["id"], 1)])
     lines.append(f"Hours moved in the plan by these: {shift / 60:+.1f} h")
     return lines

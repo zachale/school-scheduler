@@ -163,7 +163,14 @@ def planner_state(db, now: dt.datetime) -> dict:
     started = set(done) | {b["task"] for b in pinned}
     mult = learn.multipliers(learn.evidence(db, resolved, base))
     tasks = [t for t in resolved if t["id"] in base]
-    state["multiplier"] = learn.per_task(tasks, mult, started)
+    # a task keeps the multiplier it started with: changing it mid-task would leave slivers
+    current, frozen = learn.per_task(tasks, mult, set()), kv(db, "frozen_multiplier", {})
+    for tid in started:
+        if tid not in frozen and tid in current:
+            frozen[tid] = current[tid]
+    state["multiplier"] = {**{t: m for t, m in current.items() if t not in started},
+                           **{t: m for t, m in frozen.items() if t in started}}
+    set_kv(db, "frozen_multiplier", frozen)
     set_kv(db, "learned", mult)
     return state
 
@@ -360,7 +367,10 @@ def cycle(db, svc, dry_run: bool) -> None:
     if nt:
         added, updated, trashed = notion_sync.write(db, nt, cfg, resolved, now)
         log(f"  notion rows: add {added} · update {updated} · trash {trashed}")
-        write_stats(db, nt, cfg, resolved, state)
+        try:
+            write_stats(db, nt, cfg, resolved, state)
+        except Exception as e:               # the stats page is a report, never a blocker
+            log(f"stats page not updated: {e}")
     clear_alert(db, svc)
     set_kv(db, "fingerprint", fp)
     set_kv(db, "resolved", resolved)
