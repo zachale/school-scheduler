@@ -130,9 +130,14 @@ def _session_change(db, row, sid, was_done, now, grace, bot) -> None:
         return
     if not row["done"]:
         if was_done and s["status"] == "done":   # unticked: it is owed again
-            db.execute("update sessions set status = 'planned', actual_min = null, "
-                       "measured = 0 where id = ?", (sid,))
-            log(f"unchecked: {sid} is back in the plan")
+            start = dt.datetime.fromisoformat(f"{s['date']}T{s['start']}")
+            end = start + dt.timedelta(minutes=s["planned_min"])
+            # a slot already over cannot be planned in place: it becomes missed, and its
+            # minutes go back into the plan
+            status = "missed" if end <= now else "planned"
+            db.execute("update sessions set status = ?, actual_min = null, measured = 0, "
+                       "off_plan = 0, \"end\" = ? where id = ?", (status, f"{end:%H:%M}", sid))
+            log(f"unchecked: {sid} is owed again" + (" (its slot has passed)" if status == "missed" else ""))
         return
     if s["status"] == "done":
         # Actual min typed after the tick still counts
@@ -141,6 +146,13 @@ def _session_change(db, row, sid, was_done, now, grace, bot) -> None:
                        (int(row["actual_min"]), sid))
         return
     if s["status"] == "cancelled":
+        # restored from the trash and ticked: the work happened, even though its slot is
+        # gone; count it, without putting a block back on the calendar
+        actual = int(row["actual_min"] or s["planned_min"])
+        db.execute("update sessions set status = 'done', actual_min = ?, measured = ?, "
+                   "off_plan = 1 where id = ?", (actual, int(bool(row["actual_min"])), sid))
+        log(f"done: {sid} (restored and ticked), {actual} min")
+        _cancel_replacements(db, s["task"], s["planned_min"], sid)
         return
     start = dt.datetime.fromisoformat(f"{s['date']}T{s['start']}")
     end = dt.datetime.fromisoformat(f"{s['date']}T{s['end']}")
@@ -162,8 +174,24 @@ def _session_change(db, row, sid, was_done, now, grace, bot) -> None:
     db.execute("update sessions set status = 'done', actual_min = ?, measured = ?, "
                "off_plan = ?, \"end\" = ? where id = ?",
                (actual, measured, off_plan, f"{resize:%H:%M}" if resize else s["end"], sid))
+    if s["status"] == "missed":
+        # a missed block ticked late: its time was already re-planned, so give that back
+        _cancel_replacements(db, s["task"], s["planned_min"], sid)
     log(f"done: {sid} took {actual} min" + (", block removed (done off-plan)" if off_plan else
         (f", block trimmed to {resize:%H:%M}" if resize else "")))
+
+
+def _cancel_replacements(db, task: str, minutes: int, sid: str) -> None:
+    """Cancel up to `minutes` of the task's not-yet-done blocks, soonest first, including
+    one already under way: the work they were planned for turned out to be done."""
+    left = minutes
+    for r in db.execute("select * from sessions where task = ? and status = 'planned' and id <> ? "
+                        "order by date, start", (task, sid)).fetchall():
+        if left <= 0:
+            break
+        db.execute("update sessions set status = 'cancelled' where id = ?", (r["id"],))
+        left -= r["planned_min"]
+        log(f"  {r['id']} no longer needed")
 
 
 def _task_change(db, task: str, done: bool, now: dt.datetime) -> None:
@@ -309,6 +337,24 @@ def write(db, nt: notion.Notion, cfg: dict, resolved: list[dict], now: dt.dateti
         db.execute("update rows set done = 1, hash = ? where plan_id = ?", (stamp, plan_id))
         db.commit()
         updated += 1
+
+    # a task row mirrors its task when it was finished or dropped through another row
+    status = {t["id"]: t["status"] for t in resolved}
+    dropped = {r["task"] for r in db.execute("select task from dropped")}
+    for plan_id, row in list(known.items()):
+        if not plan_id.startswith("task:"):
+            continue
+        tid = plan_id.split(":", 1)[1]
+        if tid in dropped:
+            nt.trash(row["page_id"])
+            db.execute("delete from rows where plan_id = ?", (plan_id,))
+            db.commit()
+            trashed += 1
+        elif status.get(tid) == "finished" and not row["done"]:
+            nt.update(row["page_id"], {"Done": {"checkbox": True}})
+            db.execute("update rows set done = 1 where plan_id = ?", (plan_id,))
+            db.commit()
+            updated += 1
 
     # blocks that are no longer planned lose their row
     live = {f"session:{r['id']}" for r in db.execute(
