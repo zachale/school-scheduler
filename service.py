@@ -72,7 +72,7 @@ def round_up(t: dt.datetime, step: int = 5) -> dt.datetime:
 
 
 # ---------- state ------------------------------------------------------------
-SCHEMA = 2         # bump when the sessions table changes; an older file is set aside
+SCHEMA = 3         # bump when the sessions table changes; an older file is set aside
 
 
 def open_db() -> sqlite3.Connection:
@@ -108,7 +108,8 @@ def open_db() -> sqlite3.Connection:
         create table if not exists rows (      -- Could Do rows carrying a Plan ID
             plan_id text primary key, page_id text not null, hash text not null,
             done integer not null default 0, state text);
-        create table if not exists finished (task text primary key, day text not null);
+        create table if not exists finished (task text primary key, day text not null,
+                                             actual integer);  -- total minutes, if typed in
         create table if not exists dropped (task text primary key, day text not null);
         create table if not exists kv (k text primary key, v text);
     """)

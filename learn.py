@@ -1,9 +1,9 @@
 """Learned speed: how long each kind of work really takes Zach, from finished tasks.
 
 Evidence is a finished task, never a single block, since one block does not say how much
-of an assignment is done. A task counts only when most of its blocks were measured
-(checked off during the block, or given an Actual min), and its ratio is measured time
-over the unmultiplied tasks.yaml estimate. Dividing by the multiplied estimate would
+of an assignment is done. A task counts when its total time was typed into Actual min on
+its own row, or when most of its blocks were measured (checked off during the block, or
+given an Actual min); its ratio is that time over the unmultiplied tasks.yaml estimate. Dividing by the multiplied estimate would
 drag a correct multiplier back towards 1.
 
     multiplier = (sum actual + 2·mean estimate) / (sum estimate + 2·mean estimate)
@@ -35,6 +35,10 @@ def evidence(db, resolved: list[dict], base: dict[str, int]) -> dict[str, list[t
     out: dict[str, list[tuple]] = {}
     for t in resolved:
         if t["status"] != "finished" or t["id"] not in base or not group(t):
+            continue
+        total = db.execute("select actual from finished where task = ?", (t["id"],)).fetchone()
+        if total and total["actual"]:
+            out.setdefault(group(t), []).append((total["actual"], base[t["id"]], t["id"]))
             continue
         open_blocks = db.execute("select count(*) c from sessions where task = ? and "
                                  "status in ('planned', 'missed')", (t["id"],)).fetchone()["c"]

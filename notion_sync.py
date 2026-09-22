@@ -77,6 +77,10 @@ def read(db, nt: notion.Notion, cfg: dict, now: dt.datetime) -> None:
         elif row["done"] != was_done and kind in ("task", "deadline"):
             for task in ident.split(","):     # one deliverable can cover several tasks
                 _task_change(db, task, row["done"], now)
+        if kind in ("task", "deadline") and row["done"] and "," not in ident:
+            # the whole task's time, typed into Actual min on its own row
+            db.execute("update finished set actual = ? where task = ?",
+                       (int(row["actual_min"]) if row["actual_min"] else None, ident))
         db.execute("update rows set done = ? where plan_id = ?", (int(row["done"]), plan_id))
 
     for plan_id in gone:                      # confirm each one is really in the trash
@@ -196,7 +200,7 @@ def _cancel_replacements(db, task: str, minutes: int, sid: str) -> None:
 
 def _task_change(db, task: str, done: bool, now: dt.datetime) -> None:
     if done:
-        db.execute("insert or replace into finished values (?, ?)", (task, str(now.date())))
+        db.execute("insert or replace into finished (task, day) values (?, ?)", (task, str(now.date())))
         # a block under way when it was handed in closes now; later ones are not needed
         today, hhmm = str(now.date()), f"{now:%H:%M}"
         for s in db.execute("select * from sessions where task = ? and status = 'planned' "
