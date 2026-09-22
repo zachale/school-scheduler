@@ -72,9 +72,22 @@ def round_up(t: dt.datetime, step: int = 5) -> dt.datetime:
 
 
 # ---------- state ------------------------------------------------------------
+SCHEMA = 2         # bump when the sessions table changes; an older file is set aside
+
+
 def open_db() -> sqlite3.Connection:
     STATE.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(STATE / "state.db")
+    path = STATE / "state.db"
+    if path.exists():
+        old = sqlite3.connect(path)
+        version = old.execute("pragma user_version").fetchone()[0]
+        old.close()
+        if version != SCHEMA:
+            kept = path.with_suffix(f".db.v{version}")
+            path.rename(kept)
+            log(f"state.db was schema v{version}, this build needs v{SCHEMA}: kept it as "
+                f"{kept.name} and starting a fresh one")
+    db = sqlite3.connect(path)
     db.row_factory = sqlite3.Row
     db.executescript("""
         create table if not exists sessions (
@@ -88,6 +101,8 @@ def open_db() -> sqlite3.Connection:
             status      text not null,     -- planned | done | missed | cancelled
             actual_min  integer,           -- measured, or planned when not measurable
             measured    integer not null default 0,
+            off_plan    integer not null default 0,  -- ticked before it started: no block
+
             block       text not null      -- the schedule.json work block, as JSON
         );
         create table if not exists rows (      -- Could Do rows carrying a Plan ID
@@ -97,6 +112,7 @@ def open_db() -> sqlite3.Connection:
         create table if not exists dropped (task text primary key, day text not null);
         create table if not exists kv (k text primary key, v text);
     """)
+    db.execute(f"pragma user_version = {SCHEMA}")
     return db
 
 
@@ -145,18 +161,23 @@ def planner_state(db, now: dt.datetime) -> dict:
     """Everything the planner needs besides its input files. "done" counts a finished
     block at its planned length: a block ticked off early is still that block's work."""
     today, hhmm = str(now.date()), f"{now:%H:%M}"
-    done, last, awaiting = {}, {}, set()
+    done, last, wrapped = {}, {}, {}
     for r in db.execute("select * from sessions where status = 'done'"):
         done[r["task"]] = done.get(r["task"], 0) + r["planned_min"]
         last[r["task"]] = max(last.get(r["task"], r["date"]), r["date"])
-    for r in db.execute("select * from sessions where status in ('done', 'missed')"):
-        if json.loads(r["block"]).get("wrapup"):
-            awaiting.add(r["task"])           # wrapped up; now it waits to be handed in
+    # wrap-up minutes already spent or under way, so the 30-minute allowance is given once
+    for r in db.execute("select * from sessions where status in ('done', 'missed', 'planned')"):
+        if not json.loads(r["block"]).get("wrapup"):
+            continue
+        started = r["status"] != "planned" or (r["date"] < today or
+                                               (r["date"] == today and r["start"] <= hhmm))
+        if started:
+            wrapped[r["task"]] = wrapped.get(r["task"], 0) + r["planned_min"]
     pinned = [{**json.loads(r["block"]), "session": r["id"]}
               for r in db.execute("select * from sessions where status = 'planned' "
                                   "and date = ? and start < ? order by start", (today, hhmm))]
     state = {"now": f"{now:%Y-%m-%dT%H:%M}", "done": done, "last_done": last,
-             "pinned": pinned, "awaiting": sorted(awaiting), **notion_sync.state(db)}
+             "pinned": pinned, "wrapped": wrapped, **notion_sync.state(db)}
     # learned pace, from the tasks the last good plan called finished
     base = {t["id"]: t["minutes"] for t in yaml.safe_load((APP / "tasks.yaml").read_text())["tasks"]}
     resolved = kv(db, "resolved", [])
@@ -183,7 +204,7 @@ def fingerprint(busy: list[dict], state: dict) -> str:
     h.update(json.dumps(busy, sort_keys=True).encode())
     # what the plan depends on besides the inputs: the day, and which sessions are history
     h.update(json.dumps({k: state[k] for k in ("done", "finished", "dropped", "late_ok",
-                                               "awaiting", "multiplier")},
+                                               "wrapped", "multiplier")},
                         sort_keys=True).encode())
     h.update(state["now"][:10].encode())
     return h.hexdigest()
@@ -252,7 +273,7 @@ def desired_events(db, resolved: list[dict], today: dt.date) -> dict:
     want: dict[str, dict] = {}
     last: dict[str, str] = {}
     for r in db.execute("select * from sessions where status in ('planned', 'done') "
-                        "and date >= ? order by date, start", (str(today),)):
+                        "and off_plan = 0 and date >= ? order by date, start", (str(today),)):
         b = json.loads(r["block"])
         last[r["task"]] = r["date"]
         lines = [f"Really due {b['due']}"]
@@ -344,8 +365,7 @@ def cycle(db, svc, dry_run: bool) -> None:
     state = planner_state(db, now)
     fp = fingerprint(busy, state)
     if fp == kv(db, "fingerprint") and not forced and not dry_run:
-        clear_alert(db, svc)          # a quiet cycle is also a recovered one
-        return
+        return                        # nothing changed; an alert, if any, still stands
     try:
         schedule, resolved = run_planner(busy, state)
     except PlannerError as e:
@@ -356,6 +376,11 @@ def cycle(db, svc, dry_run: bool) -> None:
             set_kv(db, "fingerprint", fp)       # do not retry the same failing input
             db.commit()
         return
+    unplaced = [t for t in resolved if t["status"] == "unplaced"]
+    if unplaced and not dry_run:
+        raise_alert(db, svc, now, "These do not fit any more:\n" + "\n".join(
+            f"· {t['course']} {t['title']} ({t['owed']} min short, due {t['orig_due']})"
+            for t in unplaced[:8]))
     match_sessions(db, schedule, now)
     want = desired_events(db, resolved, now.date())
     counts = gcal.apply(svc, calendar_id(), want, now.date(), dry_run)

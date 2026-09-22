@@ -20,7 +20,8 @@ import yaml
 HERE = Path(__file__).parent
 cfg = yaml.safe_load((HERE / "config.yaml").read_text())
 resolved = json.loads((HERE / "resolved_tasks.json").read_text())
-tasks = {t["id"]: t for t in resolved if t["status"] == "scheduled"}
+# a task that only partly fits ("unplaced") still has blocks, and they obey every rule
+tasks = {t["id"]: t for t in resolved if t["status"] in ("scheduled", "unplaced")}
 sched = json.loads((HERE / "schedule.json").read_text())
 busy = json.loads((HERE / "busy.json").read_text())["busy"]
 NOW = dt.datetime.fromisoformat(json.loads((HERE / "state.json").read_text())["now"])
@@ -186,10 +187,13 @@ for day in sched:
 
 # every task's remaining minutes fully scheduled
 owed = {tid: t["minutes"] - t["done"] for tid, t in tasks.items()}
-short = [tid for tid in tasks if done[tid] != owed[tid]]
+short = [tid for tid in tasks if done[tid] != owed[tid] and tasks[tid]["status"] == "scheduled"]
 for tid in short:
     fails.append(f"task {tid} scheduled {done[tid]} of {owed[tid]} min still owed")
 for t in resolved:
+    if t["status"] == "unplaced":
+        warns.append(f"does not fit: {t['course']} {t['title']} ({t['owed'] - t['done']} min "
+                     f"short, due {t['orig_due']})")
     if t["status"] == "overdue":
         warns.append(f"overdue, no longer scheduled: {t['course']} {t['title']} "
                      f"(was due {t['orig_due']})")

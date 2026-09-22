@@ -99,9 +99,34 @@ def read(db, nt: notion.Notion, cfg: dict, now: dt.datetime) -> None:
     db.commit()
 
 
+def _import_session(db, row, sid, now) -> None:
+    """A block row the service has no record of (state.db was lost or reset): take it
+    back in from Notion, so its id is never reused and a tick on it is not lost."""
+    task, _, seq = sid.rpartition("#")
+    if not task or not seq.isdigit() or not row["start"]:
+        return
+    local = lambda v: dt.datetime.fromisoformat(v).astimezone(notion.TZ).replace(tzinfo=None)
+    start = local(row["start"])
+    end = local(row["end"]) if row["end"] else start + dt.timedelta(minutes=row["planned_min"] or 60)
+    planned = int(row["planned_min"] or (end - start).total_seconds() // 60)
+    course, _, rest = row["name"].partition(" · ")
+    title_ = rest.rsplit(" — block", 1)[0]
+    status = "done" if row["done"] else ("missed" if start < now else "planned")
+    block = {"start": f"{start:%H:%M}", "end": f"{end:%H:%M}", "title": title_, "cat": course,
+             "course": course, "task": task, "kind": "", "overflow": False, "due": "",
+             "note": ""}
+    db.execute('insert or ignore into sessions (id, task, seq, date, start, "end", planned_min, '
+               "status, actual_min, measured, block) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+               (sid, task, int(seq), str(start.date()), f"{start:%H:%M}", f"{end:%H:%M}", planned,
+                status, int(row["actual_min"] or planned) if row["done"] else None,
+                int(bool(row["actual_min"])), json.dumps(block)))
+    log(f"rebuilt block {sid} from Notion ({status})")
+
+
 def _session_change(db, row, sid, was_done, now, grace, bot) -> None:
     s = db.execute("select * from sessions where id = ?", (sid,)).fetchone()
     if s is None:
+        _import_session(db, row, sid, now)
         return
     if not row["done"]:
         if was_done and s["status"] == "done":   # unticked: it is owed again
@@ -122,17 +147,23 @@ def _session_change(db, row, sid, was_done, now, grace, bot) -> None:
     # Notion's own edit time, unless the service made that edit; then it is only as
     # precise as this cycle
     checked = edited_at(row) if row["edited_by"] != bot else now
+    off_plan = 0
     if row["actual_min"]:
         actual, resize, measured = int(row["actual_min"]), None, 1
-    elif start <= checked <= end + grace:
-        actual = max(5, int((min(checked, end) - start).total_seconds() // 60))
-        resize, measured = min(checked, end), 1   # the block ends when he finished
+        off_plan = int(checked < start)
+    elif checked < start:
+        # done off-plan, before its block: record the estimate and take the block away
+        actual, resize, measured, off_plan = s["planned_min"], None, 0, 1
+    elif checked <= end + grace:
+        actual = max(5, int((checked - start).total_seconds() // 60))   # the real time spent
+        resize, measured = min(checked, end), 1
     else:
         actual, resize, measured = s["planned_min"], None, 0
     db.execute("update sessions set status = 'done', actual_min = ?, measured = ?, "
-               "\"end\" = ? where id = ?",
-               (actual, measured, f"{resize:%H:%M}" if resize else s["end"], sid))
-    log(f"done: {sid} took {actual} min" + (f", block trimmed to {resize:%H:%M}" if resize else ""))
+               "off_plan = ?, \"end\" = ? where id = ?",
+               (actual, measured, off_plan, f"{resize:%H:%M}" if resize else s["end"], sid))
+    log(f"done: {sid} took {actual} min" + (", block removed (done off-plan)" if off_plan else
+        (f", block trimmed to {resize:%H:%M}" if resize else "")))
 
 
 def _task_change(db, task: str, done: bool, now: dt.datetime) -> None:
@@ -262,6 +293,22 @@ def write(db, nt: notion.Notion, cfg: dict, resolved: list[dict], now: dt.dateti
             db.execute("update rows set state = 'Missed' where plan_id = ?", (f"session:{s['id']}",))
             db.commit()
             updated += 1
+
+    # a block the service closed (handed in mid-block) or measured is written back, so
+    # Notion alone can rebuild the record
+    for s_ in db.execute("select * from sessions where status = 'done'"):
+        plan_id = f"session:{s_['id']}"
+        row = known.get(plan_id)
+        stamp = f"done:{s_['actual_min'] if s_['measured'] else ''}"
+        if row is None or (row["done"] and row["hash"] == stamp):
+            continue
+        props = {"Done": {"checkbox": True}}
+        if s_["measured"]:
+            props["Actual min"] = {"number": s_["actual_min"]}
+        nt.update(row["page_id"], props)
+        db.execute("update rows set done = 1, hash = ? where plan_id = ?", (stamp, plan_id))
+        db.commit()
+        updated += 1
 
     # blocks that are no longer planned lose their row
     live = {f"session:{r['id']}" for r in db.execute(

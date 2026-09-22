@@ -36,6 +36,10 @@ def evidence(db, resolved: list[dict], base: dict[str, int]) -> dict[str, list[t
     for t in resolved:
         if t["status"] != "finished" or t["id"] not in base or not group(t):
             continue
+        open_blocks = db.execute("select count(*) c from sessions where task = ? and "
+                                 "status in ('planned', 'missed')", (t["id"],)).fetchone()["c"]
+        if open_blocks:
+            continue                  # still has blocks to come: not evidence yet
         rows = db.execute("select planned_min, actual_min, measured from sessions "
                           "where task = ? and status = 'done'", (t["id"],)).fetchall()
         planned = sum(r["planned_min"] for r in rows)
@@ -92,7 +96,8 @@ def report(ev: dict[str, list[tuple]], mult: dict[str, float], tasks: list[dict]
         n = len(ev.get(g, []))
         label = names.get(g) or f"{g.split(':', 1)[1]} assignments"
         line = f"{label}: {mult[g]:.2f}× the estimate"
-        line += f" (from {n} finished task{'s' if n != 1 else ''})" if n else " (borrowed from all assignments)"
+        line += (f" (from {n} finished task{'s' if n != 1 else ''})" if n >= MIN_TASKS
+                 else " (borrowed from all assignments)")
         if g == "reading":
             line += f" — about {READ_WPM / (READ_BUFFER * mult[g]):.0f} words a minute"
         lines.append(line)

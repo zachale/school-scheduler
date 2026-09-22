@@ -323,7 +323,7 @@ def apply_state(tasks: list[dict], state: dict):
     done, last = state.get("done") or {}, state.get("last_done") or {}
     finished_ids = set(state.get("finished") or [])
     dropped_ids = set(state.get("dropped") or [])
-    awaiting_ids = set(state.get("awaiting") or [])
+    wrapped = state.get("wrapped") or {}       # wrap-up minutes already spent or under way
     speed = state.get("multiplier") or {}
     today = dt.datetime.fromisoformat(state["now"]).date()
     pinned: dict[str, int] = {}
@@ -343,12 +343,13 @@ def apply_state(tasks: list[dict], state: dict):
         elif t["id"] in finished_ids:
             status = "finished"
         elif left <= 0:
+            spare = WRAPUP_MINUTES - int(wrapped.get(t["id"], 0))
             if t["kind"] != "work":
                 status = "finished"            # its minutes are the whole job
-            elif t["id"] in awaiting_ids:
+            elif spare <= 0:
                 status = "awaiting"            # wrapped up; waiting to be handed in
             else:
-                t["minutes"] = t["_done"] + t["_pinned"] + WRAPUP_MINUTES
+                t["minutes"] = t["_done"] + t["_pinned"] + spare
                 t["_wrapup"] = True
         if status:
             t["_status"] = status
@@ -635,8 +636,20 @@ def schedule(cfg: dict, tasks: list[dict], events: list[dict], busy: list[dict],
 
         return [t for t in tasks if t["remaining"] > 0]
 
+    def drop_unplaceable_wrapups(unplaced):
+        """The wrap-up is an allowance, not owed work: if it does not fit, let it go."""
+        keep = []
+        for t in unplaced:
+            if t.get("_wrapup") and t["remaining"] <= WRAPUP_MINUTES:
+                t["_status"], t["_finished_on"] = "awaiting", now.date()
+                finished.append(t)
+                tasks.remove(t)
+            else:
+                keep.append(t)
+        return keep
+
     days = build_days()
-    unplaced = attempt(days)
+    unplaced = drop_unplaceable_wrapups(attempt(days))
     if unplaced:
         # an early-finish target that cannot be met is a preference, not a deadline
         relaxed = False
@@ -644,10 +657,25 @@ def schedule(cfg: dict, tasks: list[dict], events: list[dict], busy: list[dict],
             if t.get("_hard_due") and t["_hard_due"] > t["_due"]:
                 changes.append(f"{t['course']} {t['title']}: cannot finish "
                                f"{t['_buffer_days']} days early, using its real deadline")
-                t["_due"], t["_buffer_days"], relaxed = t["_hard_due"], None, True
+                # the early-finish promise is released for this one: verify expects no buffer
+                t["_due"], t["_buffer_days"], relaxed = t["_hard_due"], 0, True
         if relaxed:
             days = build_days()
-            unplaced = attempt(days)
+            unplaced = drop_unplaceable_wrapups(attempt(days))
+    if unplaced:
+        # last resort: give back the learned speed and the post spacing rather than
+        # leave work unscheduled and the whole plan frozen
+        for t in unplaced:
+            t["minutes"] = t.get("_base", t["minutes"])
+            t.pop("spread_group", None)
+            if t.get("_hard_due") and t["_hard_due"] > t["_due"]:
+                t["_due"], t["_buffer_days"] = t["_hard_due"], 0
+            changes.append(f"{t['course']} {t['title']}: tight, so its learned pace and post "
+                           "spacing are set aside to fit it in")
+        days = build_days()
+        unplaced = drop_unplaceable_wrapups(attempt(days))
+    for t in unplaced:
+        t["_status"] = "unplaced"
     return days, unplaced, tasks, overdue, finished, changes
 
 
@@ -855,7 +883,8 @@ def main() -> None:
         "finished_on": str(t["_finished_on"]) if "_finished_on" in t else None,
     }
     (HERE / "resolved_tasks.json").write_text(json.dumps(
-        [row(t, "scheduled") for t in tasks] + [row(t, "overdue") for t in overdue]
+        [row(t, "unplaced" if t.get("_status") == "unplaced" else "scheduled")
+         for t in tasks] + [row(t, "overdue") for t in overdue]
         + [row(t, t["_status"]) for t in finished], indent=1))
     (HERE / "schedule.json").write_text(json.dumps([{
         "date": str(d.date),
