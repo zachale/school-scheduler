@@ -83,11 +83,14 @@ def desired_events(schedule: list[dict], tasks: list[dict]) -> dict[str, dict]:
         due = dt.datetime.strptime(t["orig_due"], "%Y-%m-%d %H:%M")
         if t["kind"] != "work" or str(due.date()) < start:
             continue
-        done = dt.date.fromisoformat(last[t["id"]])
+        if t["id"] in last:
+            done = dt.date.fromisoformat(last[t["id"]])
+            note = f"Last planned session {done:%a %b %d}, {(due.date() - done).days} days before."
+        else:
+            note = "No session is planned for it: check the planner's warnings."
         out[f"due|{t['id']}"] = {
             "summary": f"⚑ Due {due:%H:%M}: {t['course']} {t['title']}",
-            "description": f"Real deadline. Last planned session {done:%a %b %d}, "
-                           f"{(due.date() - done).days} days before.",
+            "description": f"Real deadline. {note}",
             "start": {"date": str(due.date())},
             "end": {"date": str(due.date() + dt.timedelta(days=1))},
             "transparency": "transparent",
@@ -115,13 +118,17 @@ def fetch_busy(svc, calendars: list[str], start: dt.date, end: dt.date) -> list[
                 raise SystemExit(f"cannot read free/busy for {cid}: {cal['errors']}. "
                                  f"Is it shared with {SERVICE_ACCOUNT}?")
             for b in cal.get("busy", []):
-                s = dt.datetime.fromisoformat(b["start"]).astimezone(tz)
-                e = dt.datetime.fromisoformat(b["end"]).astimezone(tz)
+                # step in UTC: aware datetimes sharing one ZoneInfo compare by wall clock,
+                # which misorders times inside the repeated hour when DST ends
+                s = dt.datetime.fromisoformat(b["start"]).astimezone(dt.timezone.utc)
+                e = dt.datetime.fromisoformat(b["end"]).astimezone(dt.timezone.utc)
                 while s < e:
-                    midnight = dt.datetime.combine(s.date() + dt.timedelta(days=1), dt.time(), tz)
+                    local = s.astimezone(tz)
+                    midnight = dt.datetime.combine(local.date() + dt.timedelta(days=1), dt.time(),
+                                                   tz).astimezone(dt.timezone.utc)
                     cut = min(e, midnight)
-                    seen.add((str(s.date()), f"{s:%H:%M}",
-                              "24:00" if cut == midnight else f"{cut:%H:%M}"))
+                    seen.add((str(local.date()), f"{local:%H:%M}",
+                              "24:00" if cut == midnight else f"{cut.astimezone(tz):%H:%M}"))
                     s = cut
         d = stop
     return [{"date": a, "start": b, "end": c} for a, b, c in sorted(seen)]

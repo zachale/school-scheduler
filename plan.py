@@ -82,6 +82,12 @@ def class_weekday(cfg: dict, date: dt.date) -> int | None:
     return date.weekday()
 
 
+def skipped_labs(cfg: dict, date: dt.date) -> list[dict]:
+    """Skipped labs that would run on this date."""
+    wd = class_weekday(cfg, date)
+    return [c for c in cfg["classes"] if c.get("skip") and wd is not None and wd in c["days"]]
+
+
 def attended(cfg: dict) -> list[dict]:
     """Classes actually gone to; skipped labs are listed in config only so their
     calendar slots are recognised."""
@@ -178,17 +184,21 @@ class Day:
             self.fixed.append({"start": s, "end": e, "title": ev["title"], "cat": "Personal"})
 
         # busy time on Zach's own calendars, minus anything already accounted for above
-        # (his calendar carries the same classes, labs and exams)
+        # (his calendar carries the same classes and exams). A skipped lab's own calendar
+        # event is ignored only when free/busy returns exactly its slot: free/busy merges
+        # overlapping events, so a longer interval may hide a real commitment and stays busy.
         known = [(b["start"], b["end"]) for b in self.fixed]
-        known += [(hm(c["start"]), hm(c["end"])) for c in self.cfg["classes"]
-                  if wd is not None and wd in c["days"]]
+        lab_slots = {(hm(c["start"]), hm(c["end"])) for c in skipped_labs(self.cfg, self.date)}
         buf = self.cfg["google_calendar"]["buffer_minutes"]
         added: list[tuple[int, int]] = []
         for b in busy:
-            parts = [(hm(b["start"]), hm(b["end"]))]
+            span = (hm(b["start"]), hm(b["end"]))
+            if span in lab_slots:
+                continue
+            parts = [span]
             for k in known:
                 parts = subtract(parts, k)
-            added += [(s, e) for s, e in parts if e - s >= 15]
+            added += parts
         for s, e in added:
             self.fixed.append({"start": s, "end": e, "title": "Busy (Google Calendar)",
                                "cat": "Personal"})
@@ -224,13 +234,25 @@ class Day:
         if self.blocked:
             return []
         w = self.cfg["work_hours"]
-        if not overflow and not w.get("include_weekends", True) and self.date.weekday() >= 5:
+        if not w.get("include_weekends", True) and self.date.weekday() >= 5:
             return []
         rng = w["overflow"] if overflow else w["core"]
         free = [(hm(rng[0]), hm(rng[1]))]
         for b in self.fixed + self.blocks:
             free = subtract(free, (b["start"], b["end"]))
         return [(s, e) for s, e in free if e - s >= 20]
+
+    def run_before(self, t: int, gap: int) -> int:
+        """Minutes of work running up to time t without a gap of `gap` minutes or more."""
+        run, cursor = 0, t
+        for b in sorted(self.blocks, key=lambda b: b["end"], reverse=True):
+            if b["end"] > cursor:
+                continue
+            if cursor - b["end"] >= gap:
+                break
+            run += b["end"] - b["start"]
+            cursor = b["start"]
+        return run
 
     def worked(self, overflow: bool | None = None) -> int:
         if overflow is None:
@@ -468,7 +490,7 @@ def schedule(cfg: dict, tasks: list[dict], events: list[dict], busy: list[dict],
                                 chunk = t["remaining"] - 20   # leave a real session instead
                         brk_after = S.get("break_after_minutes", 90)
                         brk = S.get("break_minutes", 15)
-                        if chunk >= brk_after and s + chunk + brk <= e:
+                        if day.run_before(s, brk) + chunk >= brk_after:
                             day.fixed.append({"start": s + chunk, "end": s + chunk + brk,
                                               "title": "Break", "cat": "Break"})
                         day.blocks.append({

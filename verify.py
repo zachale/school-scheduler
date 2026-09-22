@@ -26,6 +26,18 @@ START = max(cfg["term"]["start"], progress["through"] + dt.timedelta(days=1))
 hm = lambda s: int(s[:2]) * 60 + int(s[3:])
 dtm = lambda s: dt.datetime.strptime(s, "%Y-%m-%d %H:%M")
 
+def class_weekday(date):
+    """Which weekday's classes run on this date (None = no classes), as plan.py decides."""
+    for o in cfg.get("schedule_overrides") or []:
+        if o["date"] == date:
+            return o["runs_schedule_of"]
+    if any(n["date"] == date for n in cfg.get("no_class_days") or []):
+        return None
+    if date > cfg["term"]["last_class_day"]:
+        return None
+    return date.weekday()
+
+
 fails, oks, warns = [], [], []
 def check(cond, ok_msg, fail_msg=None):
     (oks if cond else fails).append(ok_msg if cond else (fail_msg or ok_msg))
@@ -73,6 +85,8 @@ for day in sched:
                 fails.append(f"{date} overlap: {wb['title']} vs {fb['title']}")
         if not (CORE[0] <= ws and we <= CORE[1]) and not (OVER[0] <= ws and we <= OVER[1]):
             fails.append(f"{date} outside hours: {wb['title']} {wb['start']}-{wb['end']}")
+        if not cfg["work_hours"].get("include_weekends", True) and date.weekday() >= 5:
+            fails.append(f"{date} outside hours: weekend work {wb['title']}")
         t = tasks[wb["task"]]
         end = dt.datetime.combine(date, dt.time(we // 60, we % 60))
         if date < dt.date.fromisoformat(t["earliest"]):
@@ -82,22 +96,35 @@ for day in sched:
         if end > dtm(t["orig_due"]) and not t["overdue"]:
             fails.append(f"{date} AFTER REAL DEADLINE: {wb['title']} (due {t['orig_due']})")
         done[wb["task"]] += we - ws
-    # busy time on Zach's calendars: no work on it, except over a skipped lab's slot,
-    # which the planner deliberately treats as free
-    labs = [(hm(c["start"]), hm(c["end"])) for c in cfg["classes"]
-            if c.get("skip") and date.weekday() in c["days"]]
+    # busy time on Zach's calendars: no work on it. The one exemption is free/busy
+    # returning exactly a skipped lab's slot, which the planner deliberately leaves free.
+    wd = class_weekday(date)
+    labs = {(hm(c["start"]), hm(c["end"])) for c in cfg["classes"]
+            if c.get("skip") and wd is not None and wd in c["days"]}
     for b in busy:
         if b["date"] != day["date"]:
             continue
-        parts = [(hm(b["start"]), hm(b["end"]))]
-        for ls, le in labs:
-            parts = [(s, e) for ps, pe in parts
-                     for s, e in ((ps, min(pe, ls)), (max(ps, le), pe)) if e > s]
+        bs, be = hm(b["start"]), hm(b["end"])
+        if (bs, be) in labs:
+            continue
         for ws, we, wb in work:
-            if any(ws < be and bs < we for bs, be in parts):
+            if ws < be and bs < we:
                 fails.append(f"{date} work on busy calendar time: {wb['title']} "
                              f"{wb['start']}-{wb['end']} vs busy {b['start']}-{b['end']}")
         n["busy"] += 1
+    # breaks: once continuous work reaches break_after_minutes, the next block must wait
+    # at least break_minutes (a shorter gap does not count as a break)
+    BRK, BRK_AFTER = S.get("break_minutes", 15), S.get("break_after_minutes", 90)
+    run, prev_end = 0, None
+    for ws, we, wb in sorted(work, key=lambda x: x[0]):
+        if prev_end is not None and ws - prev_end < BRK:
+            if run >= BRK_AFTER:
+                fails.append(f"{date} no break: {wb['title']} starts {wb['start']} after "
+                             f"{run} min of continuous work")
+            run += we - ws
+        else:
+            run = we - ws
+        prev_end = we
     for i in range(len(work)):
         for j in range(i + 1, len(work)):
             if work[i][0] < work[j][1] and work[j][0] < work[i][1]:
@@ -224,7 +251,8 @@ if EF:
         if EF_FROM and real < EF_FROM:
             continue
         got = (real - dt.date.fromisoformat(last[tid])).days
-        want = min(EF, tk.get("buffer_days") or EF)   # release may cap it
+        cap = tk.get("buffer_days")
+        want = EF if cap is None else min(EF, cap)   # release may cap it, even to 0
         if got < want:
             short_buf.append(f"{tid}: finishes {got} d early, expected {want}")
     fails += short_buf
@@ -233,7 +261,9 @@ if EF:
           f"{len(short_buf)} hand-ins short of the {EF}-day buffer")
 
 check(not any("session too long" in f for f in fails),
-      f"every session <= {S['default_max_minutes']//60} h, with a break after long ones")
+      f"every session <= {S['default_max_minutes']//60} h")
+check(not any("no break" in f for f in fails),
+      f"a {S.get('break_minutes', 15)}-min break after every {S.get('break_after_minutes', 90)} min of continuous work")
 
 for o in oks:   print(f"  ok   {o}")
 for w in warns: print(f"  warn {w}")
