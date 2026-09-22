@@ -27,6 +27,7 @@ uv run gcal.py sync             # mirror it into the "F26 Plan" Google Calendar
 | `busy.json` | Snapshot of busy time on Zach's calendars (times only, no titles) |
 | `gcal.json` | The "F26 Plan" calendar's id, written by the first sync |
 | `_gen_tasks.py` | One-off that built `tasks.yaml`; kept for provenance |
+| `PRD-autoplanner.md` | Draft PRD for the no-LLM service that replans on its own |
 
 ## Changing the plan in plain English
 
