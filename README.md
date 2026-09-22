@@ -28,9 +28,13 @@ ssh vm 'cd f26-planner && ~/.local/bin/uv run service.py --once --dry-run'   # p
 | `service.py` | The always-on loop on the VM: rollover, free/busy, replan, verify, calendar writes |
 | `gcal.py` | Google Calendar library used by the service (free/busy, batched keyed writes) |
 | `gcal.json` | The "F26 Plan" calendar's id |
+| `notion.py` | Notion client for Could Do (the F26 Planner connection) |
+| `notion_sync.py` | Reads ticks, deletions and Missed/Late OK from Could Do; writes a row per task and block |
+| `notion_map.py` | Maps the existing deliverable rows to planner tasks (used once, and daily after) |
+| `learn.py` | Learned pace: speed multipliers per kind of work, from finished measured tasks |
 | `deploy/` | systemd user unit and `deploy.sh` |
 | `_gen_tasks.py` | One-off that built `tasks.yaml`; kept for provenance |
-| `PRD-autoplanner.md` | Draft PRD for the no-LLM service that replans on its own |
+| `PRD-autoplanner.md` | PRD for the no-LLM service that replans on its own |
 
 ## Changing the plan in plain English
 
@@ -40,7 +44,11 @@ service replans within a minute. The translations are mechanical:
 | You say | What changes |
 |---|---|
 | "I have a thing Thursday 6–9pm" | nothing, if it is a Busy event on your calendar; otherwise a row in `events.yaml` |
-| "I didn't do today's blocks" | until Notion tracking lands (PRD M3), their sessions are set to `missed` in the VM's `state.db`, which returns the minutes to the task; anything else that has passed is assumed done |
+| "I did this block" | tick it in Could Do; ticking during the block (or within 15 min after) records the real time and trims the calendar block |
+| "I handed it in" | tick the deliverable row; its remaining blocks are cancelled |
+| "I didn't do today's blocks" | nothing: a block still unticked when the day ends becomes Missed and its time is planned again |
+| "drop this task" | delete its row in Could Do; restoring it from the trash brings it back |
+| "keep working on it after the deadline" | set its Plan state to Late OK |
 | "no weekends" | `work_hours.include_weekends: false` |
 | "I can work till 11 on weeknights" | `work_hours.overflow` |
 | "CIS 4020's project is a group project, halve it" | the `minutes` on `cis4020-proj` |
@@ -164,26 +172,38 @@ Sources: [Calendars: insert](https://developers.google.com/workspace/calendar/ap
 [ICS refresh rates](https://calfeed.ai/learn/ics-refresh-rate-apple-google),
 [7-day testing tokens](https://dev.to/ko-hi/googles-oauth-testing-mode-expires-refresh-tokens-in-7-days-publish-the-consent-screen-before-24hm).
 
-## Mapping to Notion `Could Do`
+## Notion tracking
 
-Checked 2026-09-21 with `notion_map.py` against a snapshot of the 71 F26 rows
-(`notion_rows.tsv`). It is **not 1:1**, but every row and every task is accounted for:
+Could Do is the only "done" signal once the connection token is on the VM
+(`~/.config/f26-planner/notion-token`, mode 0600). Without it, the service assumes a block that
+has passed was done.
 
-| Relationship | Notion rows | Planner tasks |
-|---|---:|---:|
-| 1:1 — hand-ins, ENVS weekly readings, Respondus practice | 35 | 35 |
-| 1:1 — exam row ↔ its prep task (5 midterms, 4 finals) | 9 | 9 |
-| 1:3 — ENVS discussion ↔ its three posts | 5 | 15 |
-| 1:2 — ENVS midterm ↔ prep + sitting the 24 h window | 2 | 4 |
-| Notion only — CIS*3210 in-lecture quizzes (no prep scheduled) | 20 | 0 |
-| Planner only — weekly reviews/practice, CIS*4020 project analysis | 0 | 31 |
-| **Total** | **71** | **94** |
+Rows the planner manages carry a `Plan ID`; nothing else in Could Do is read or written.
 
-The generated catch-up tasks (one per course after the Oct 5–10 write-off) have no Notion
-row either. Deadlines agree on every mapped pair except three, two of them deliberate: ENVS
-midterm prep and sitting are planned for the window's first day, not its close, and the
-CIS*4020 presentation is prepared by the Nov 24 start of its window. The one real
-disagreement is ENVS week 1 reading: Notion ends it Sun Sep 20, the planner Mon Sep 21.
+| Plan ID | Row | Ticking it means |
+|---|---|---|
+| `deadline:<task>[,<task>…]` | a deliverable Zach already had (51 of them, adopted on the first run) | handed in: its tasks are finished |
+| `task:<task>` | a planner task with no deliverable of its own, or one of several under a deliverable | that task is finished |
+| `session:<task>#<n>` | one calendar block, a sub-item of its task or deliverable | that block is done |
+
+Every cycle scans all Plan ID rows and diffs them against the service's SQLite record, because
+a "changed since" query cannot see deleted rows and Notion rounds edit times to the minute.
+Deleting a block's row replans it; deleting a task's or deliverable's row drops the task;
+restoring it from the trash brings it back. Notion holds the whole record (the service writes
+its own ticks and measured minutes back), so a lost `state.db` is rebuilt from a scan.
+
+**Learned pace** (`learn.py`): a finished task whose blocks were mostly measured is evidence;
+each kind of work (readings, posts, reviews, exam prep, assignments per course) gets a
+multiplier once it has two such tasks, damped by two phantom on-estimate tasks and clamped to
+0.5–2×. It applies only to tasks not yet started. The **Planner stats** page in Notion shows it.
+
+**When the plan does not fit**: the planner first releases a hand-in's 3-day early-finish
+target, then its learned pace and post spacing; whatever still does not fit is flagged in a
+⚠ calendar alert while everything else keeps reflowing.
+
+The original name-based mapping of rows to tasks, and why it is not 1:1, is in
+`notion_map.py` (checked 2026-09-21 against `notion_rows.tsv`: 44 one-to-one, 7 one-to-many,
+20 quiz rows with no planner task, 31 planner-only tasks).
 
 ## Current state
 

@@ -1,7 +1,7 @@
 ---
 title: F26 autoplanner — PRD
 date: 2026-09-21
-status: draft
+status: built — M1 live 2026-09-22; M2–M4 built, go-live pending the Notion token
 tags: [school, planner, notion, google-calendar]
 related: [[fall-2026-deliverables]], [[fall-2026-effort-estimates]]
 ---
