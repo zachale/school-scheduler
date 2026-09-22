@@ -20,6 +20,8 @@ state.json:
     done       {task id: minutes finished in earlier sessions}
     last_done  {task id: date of its latest finished session}  (spacing discussion posts)
     pinned     [started blocks today, as schedule.json work blocks, each with "session"]
+    locked     [blocks Zach moved in Notion: fixed where he put them; each with "date"]
+    sized      {session: {"task", "minutes"}} blocks Zach resized: that length, placed freely
     finished   [task ids whose Notion row is checked]
     dropped    [task ids whose Notion row was deleted]
     late_ok    [task ids to keep scheduling after their deadline has passed]
@@ -327,7 +329,7 @@ def apply_state(tasks: list[dict], state: dict):
     speed = state.get("multiplier") or {}
     today = dt.datetime.fromisoformat(state["now"]).date()
     pinned: dict[str, int] = {}
-    for b in state.get("pinned") or []:
+    for b in (state.get("pinned") or []) + (state.get("locked") or []):
         pinned[b["task"]] = pinned.get(b["task"], 0) + hm(b["end"]) - hm(b["start"])
     owed, closed = [], []
     for t in tasks:
@@ -507,11 +509,19 @@ def schedule(cfg: dict, tasks: list[dict], events: list[dict], busy: list[dict],
             for b in state.get("pinned") or []:
                 days[0].blocks.append({**b, "start": hm(b["start"]), "end": hm(b["end"]),
                                        "pinned": True})
-            brk, brk_after = S.get("break_minutes", 15), S.get("break_after_minutes", 90)
-            for b in days[0].blocks:         # a long started session still earns its break
-                if days[0].run_before(b["end"], brk) >= brk_after:
-                    days[0].fixed.append({"start": b["end"], "end": b["end"] + brk,
-                                          "title": "Break", "cat": "Break"})
+        # blocks Zach moved stay exactly where he put them, on any day
+        by_date = {d.date: d for d in days}
+        for b in state.get("locked") or []:
+            day = by_date.get(dt.date.fromisoformat(b["date"]))
+            if day:
+                day.blocks.append({**b, "start": hm(b["start"]), "end": hm(b["end"]),
+                                   "pinned": True, "locked": True})
+        brk, brk_after = S.get("break_minutes", 15), S.get("break_after_minutes", 90)
+        for day in days:                     # a long fixed run still earns its break
+            for b in sorted(day.blocks, key=lambda b: b["end"]):
+                if day.run_before(b["end"], brk) >= brk_after:
+                    day.fixed.append({"start": b["end"], "end": b["end"] + brk,
+                                      "title": "Break", "cat": "Break"})
         return days
 
     S = cfg["sessions"]
@@ -519,9 +529,14 @@ def schedule(cfg: dict, tasks: list[dict], events: list[dict], busy: list[dict],
     total_cap = int(S["max_total_hours_per_day"] * 60)
     exam_cap = int(S.get("exam_day_max_hours", S["max_total_hours_per_day"]) * 60)
 
+    sized_by_task: dict[str, list] = {}
+    for sid, v in (state.get("sized") or {}).items():
+        sized_by_task.setdefault(v["task"], []).append((sid, int(v["minutes"])))
+
     def attempt(days):
         for t in tasks:
             t["remaining"] = t["minutes"] - t["_done"] - t["_pinned"]
+            t["_sizes"] = sorted(sized_by_task.get(t["id"], []))   # resized blocks, in order
 
         def latest_start(t, today):
             """Latest date this task can begin and still finish at ~5 h/day,
@@ -590,16 +605,24 @@ def schedule(cfg: dict, tasks: list[dict], events: list[dict], busy: list[dict],
                             if e - s < 20:
                                 continue
                             room = int(min(e - s, cap - used))
-                            chunk = int(min(t["remaining"], t["max_minutes"], room))
-                            if chunk < min(t["min_minutes"], t["remaining"]):
-                                continue
-                            # never leave a sliver of a task behind: absorb a leftover under
-                            # 20 min into this session, allowing up to 15 min past the max
-                            if 0 < t["remaining"] - chunk < 20:
-                                if t["remaining"] <= min(room, t["max_minutes"] + 15):
-                                    chunk = t["remaining"]
-                                else:
-                                    chunk = t["remaining"] - 20   # leave a real session instead
+                            if t["_sizes"]:
+                                # a block Zach resized keeps its length: it needs a gap that big
+                                sid, want = t["_sizes"][0]
+                                chunk = min(want, t["remaining"])
+                                if chunk > room:
+                                    continue
+                            else:
+                                sid = None
+                                chunk = int(min(t["remaining"], t["max_minutes"], room))
+                                if chunk < min(t["min_minutes"], t["remaining"]):
+                                    continue
+                                # never leave a sliver of a task behind: absorb a leftover under
+                                # 20 min into this session, allowing up to 15 min past the max
+                                if 0 < t["remaining"] - chunk < 20:
+                                    if t["remaining"] <= min(room, t["max_minutes"] + 15):
+                                        chunk = t["remaining"]
+                                    else:
+                                        chunk = t["remaining"] - 20   # leave a real session instead
                             brk_after = S.get("break_after_minutes", 90)
                             brk = S.get("break_minutes", 15)
                             if day.run_before(s, brk) + chunk >= brk_after:
@@ -611,7 +634,10 @@ def schedule(cfg: dict, tasks: list[dict], events: list[dict], busy: list[dict],
                                 "kind": t["kind"], "overflow": overflow,
                                 "due": t["due"], "note": t.get("note", ""),
                                 **({"wrapup": True} if t.get("_wrapup") else {}),
+                                **({"session": sid, "sized": True} if sid else {}),
                             })
+                            if sid:
+                                t["_sizes"].pop(0)
                             t["remaining"] -= chunk
                             if t.get("spread_group") and t["remaining"] == 0:
                                 group_days.setdefault(t["spread_group"], []).append(day.date)
@@ -628,6 +654,7 @@ def schedule(cfg: dict, tasks: list[dict], events: list[dict], busy: list[dict],
                 if (merged and merged[-1]["task"] == b["task"] and merged[-1]["end"] == b["start"]
                         and merged[-1]["overflow"] == b["overflow"]
                         and not merged[-1].get("pinned") and not b.get("pinned")
+                        and not merged[-1].get("sized") and not b.get("sized")
                         and b["end"] - merged[-1]["start"] <= S["default_max_minutes"]):
                     merged[-1]["end"] = b["end"]
                 else:

@@ -44,7 +44,10 @@ service replans within a minute. The translations are mechanical:
 | You say | What changes |
 |---|---|
 | "I have a thing Thursday 6–9pm" | nothing, if it is a Busy event on your calendar; otherwise a row in `events.yaml` |
-| "I did this block" | tick it in Could Do; ticking during the block (or within 15 min after) records the real time and trims the calendar block |
+| "I did this block" | tick it in Could Do; ticking during it trims the block to the tick, ticking before its time moves it to end at the tick |
+| "that took longer / happened earlier" | drag or resize the ticked block in Notion Calendar: its size is the time spent |
+| "make this block shorter" | resize it (same start): it keeps that length, and the planner may still move it |
+| "I'll do this block then" | drag it to a new start: it is locked there and never moved again |
 | "I handed it in" | tick the deliverable row; its remaining blocks are cancelled |
 | "I didn't do today's blocks" | nothing: a block still unticked when the day ends becomes Missed and its time is planned again |
 | "drop this task" | delete its row in Could Do; restoring it from the trash brings it back |
@@ -126,9 +129,9 @@ ENVS*2210 penalises clustering posts into the final 24 hours.
 
 ## Google Calendar sync
 
-The service mirrors the plan into a dedicated **"F26 Plan"** calendar: every work block,
-plus an all-day ⚑ event on each hand-in's real deadline, plus all-day ⚠ events for overdue
-work and planner failures. Each block has a stable session id (`<task>#<n>`, never reused),
+Since 2026-09-22 18:15 the blocks and deadlines live only in Notion (Could Do rows, shown and
+edited in Notion Calendar). **"F26 Plan" holds only all-day ⚠ warnings**: overdue work, work
+that no longer fits, and planner failures. Each block has a stable session id (`<task>#<n>`, never reused),
 and each event carries that key and a content hash, so a replan only adds, updates or
 deletes what changed, in batches. Days before today are left alone as history.
 
@@ -191,6 +194,13 @@ a "changed since" query cannot see deleted rows and Notion rounds edit times to 
 Deleting a block's row replans it; deleting a task's or deliverable's row drops the task;
 restoring it from the trash brings it back. Notion holds the whole record (the service writes
 its own ticks and measured minutes back), so a lost `state.db` is rebuilt from a scan.
+
+**A block's size is its time.** Ticked blocks count at the size they have on the calendar,
+and Zach may drag or resize a block after ticking it to match what really happened. Before
+it is ticked, a resize keeps the block at that length (it can still move), and changing its
+start locks it where he put it. The service tells his edits from its own writes by the
+row's last editor and by the times it last wrote (`rows.w_start`/`w_end`). Task rows are
+all-day, so only blocks carry times.
 
 **Learned pace** (`learn.py`): a finished task whose blocks were mostly measured is evidence;
 each kind of work (readings, posts, reviews, exam prep, assignments per course) gets a

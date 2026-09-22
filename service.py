@@ -72,7 +72,13 @@ def round_up(t: dt.datetime, step: int = 5) -> dt.datetime:
 
 
 # ---------- state ------------------------------------------------------------
-SCHEMA = 3         # bump when the sessions table changes; an older file is set aside
+SCHEMA = 4         # bump when a table changes; add the in-place step to MIGRATIONS
+MIGRATIONS = {     # from version -> statements that bring it to the next one
+    3: ["alter table sessions add column locked integer not null default 0",
+        "alter table sessions add column user_min integer",
+        "alter table rows add column w_start text",
+        "alter table rows add column w_end text"],
+}
 
 
 def open_db() -> sqlite3.Connection:
@@ -81,6 +87,13 @@ def open_db() -> sqlite3.Connection:
     if path.exists():
         old = sqlite3.connect(path)
         version = old.execute("pragma user_version").fetchone()[0]
+        while version in MIGRATIONS:
+            for stmt in MIGRATIONS[version]:
+                old.execute(stmt)
+            version += 1
+            old.execute(f"pragma user_version = {version}")
+            old.commit()
+            log(f"state.db migrated to schema v{version}")
         old.close()
         if version != SCHEMA:
             kept = path.with_suffix(f".db.v{version}")
@@ -101,13 +114,16 @@ def open_db() -> sqlite3.Connection:
             status      text not null,     -- planned | done | missed | cancelled
             actual_min  integer,           -- measured, or planned when not measurable
             measured    integer not null default 0,
-            off_plan    integer not null default 0,  -- ticked before it started: no block
+            off_plan    integer not null default 0,  -- (unused since v4; kept for old rows)
+            locked      integer not null default 0,  -- Zach moved it: it stays where he put it
+            user_min    integer,           -- Zach resized it: it keeps this length
 
             block       text not null      -- the schedule.json work block, as JSON
         );
         create table if not exists rows (      -- Could Do rows carrying a Plan ID
             plan_id text primary key, page_id text not null, hash text not null,
-            done integer not null default 0, state text);
+            done integer not null default 0, state text,
+            w_start text, w_end text);     -- a block row's times as the service last wrote them
         create table if not exists finished (task text primary key, day text not null,
                                              actual integer);  -- total minutes, if typed in
         create table if not exists dropped (task text primary key, day text not null);
@@ -159,12 +175,12 @@ def rollover(db, now: dt.datetime, commit: bool = True) -> bool:
 
 
 def planner_state(db, now: dt.datetime) -> dict:
-    """Everything the planner needs besides its input files. "done" counts a finished
-    block at its planned length: a block ticked off early is still that block's work."""
+    """Everything the planner needs besides its input files. A block's size on the
+    calendar is its time: "done" counts the ticked blocks at the size they have now."""
     today, hhmm = str(now.date()), f"{now:%H:%M}"
     done, last, wrapped = {}, {}, {}
     for r in db.execute("select * from sessions where status = 'done'"):
-        done[r["task"]] = done.get(r["task"], 0) + r["planned_min"]
+        done[r["task"]] = done.get(r["task"], 0) + minutes(r)
         last[r["task"]] = max(last.get(r["task"], r["date"]), r["date"])
     # a task finished through its row, with no block of its own, dates from that row
     # (discussion-post spacing counts from it)
@@ -177,16 +193,23 @@ def planner_state(db, now: dt.datetime) -> dict:
         started = r["status"] != "planned" or (r["date"] < today or
                                                (r["date"] == today and r["start"] <= hhmm))
         if started:
-            wrapped[r["task"]] = wrapped.get(r["task"], 0) + r["planned_min"]
-    pinned = [{**json.loads(r["block"]), "session": r["id"]}
-              for r in db.execute("select * from sessions where status = 'planned' "
-                                  "and date = ? and start < ? order by start", (today, hhmm))]
+            wrapped[r["task"]] = wrapped.get(r["task"], 0) + minutes(r)
+    pinned, locked, sized = [], [], {}
+    for r in db.execute("select * from sessions where status = 'planned' order by date, start"):
+        block = {**json.loads(r["block"]), "start": r["start"], "end": r["end"], "session": r["id"]}
+        if r["date"] == today and r["start"] < hhmm:
+            pinned.append(block)                          # under way: history now
+        elif r["locked"]:
+            locked.append({**block, "date": r["date"]})   # he moved it: it stays there
+        elif r["user_min"]:
+            sized[r["id"]] = {"task": r["task"], "minutes": r["user_min"]}
     state = {"now": f"{now:%Y-%m-%dT%H:%M}", "done": done, "last_done": last,
-             "pinned": pinned, "wrapped": wrapped, **notion_sync.state(db)}
+             "pinned": pinned, "locked": locked, "sized": sized, "wrapped": wrapped,
+             **notion_sync.state(db)}
     # learned pace, from the tasks the last good plan called finished
     base = {t["id"]: t["minutes"] for t in yaml.safe_load((APP / "tasks.yaml").read_text())["tasks"]}
     resolved = kv(db, "resolved", [])
-    started = set(done) | {b["task"] for b in pinned}
+    started = set(done) | {b["task"] for b in pinned + locked}
     mult = learn.multipliers(learn.evidence(db, resolved, base))
     tasks = [t for t in resolved if t["id"] in base]
     # a task keeps the multiplier it started with: changing it mid-task would leave slivers
@@ -209,7 +232,8 @@ def fingerprint(busy: list[dict], state: dict) -> str:
     h.update(json.dumps(busy, sort_keys=True).encode())
     # what the plan depends on besides the inputs: the day, and which sessions are history
     h.update(json.dumps({k: state[k] for k in ("done", "finished", "dropped", "late_ok",
-                                               "wrapped", "multiplier", "last_done")},
+                                               "wrapped", "multiplier", "last_done",
+                                               "locked", "sized")},
                         sort_keys=True).encode())
     h.update(state["now"][:10].encode())
     return h.hexdigest()
@@ -239,24 +263,34 @@ class PlannerError(RuntimeError):
 
 
 def match_sessions(db, schedule: list[dict], now: dt.datetime) -> None:
-    """Give each new future block a stable session id: a task's future blocks, in time
-    order, take over its open sessions in time order. Leftover open sessions are
-    cancelled; extra blocks get new, never-reused numbers."""
+    """Give each new future block a stable session id. A block Zach resized comes back
+    carrying its own id; the rest of a task's future blocks, in time order, take over its
+    other open sessions in time order. Leftover open sessions are cancelled; extra blocks
+    get new, never-reused numbers. Blocks he moved are his and are left alone."""
     key = lambda date, start: (date, start)
     cut = key(str(now.date()), f"{now:%H:%M}")
     blocks: dict[str, list] = {}
     for day in schedule:
         for b in day["work"]:
-            if not b.get("pinned"):
-                blocks.setdefault(b["task"], []).append((day["date"], b))
+            if b.get("pinned"):
+                continue
+            if b.get("session"):                  # a resized block: same session, new slot
+                db.execute('update sessions set date = ?, start = ?, "end" = ?, block = ? '
+                           "where id = ?", (day["date"], b["start"], b["end"], json.dumps(b),
+                                            b["session"]))
+                continue
+            blocks.setdefault(b["task"], []).append((day["date"], b))
+    placed_sized = {b["session"] for day in schedule for b in day["work"] if b.get("session")
+                    and not b.get("pinned")}
     open_rows: dict[str, list] = {}
-    for r in db.execute("select * from sessions where status = 'planned' order by date, start"):
-        if key(r["date"], r["start"]) >= cut:
+    for r in db.execute("select * from sessions where status = 'planned' and locked = 0 "
+                        "order by date, start"):
+        if key(r["date"], r["start"]) >= cut and r["id"] not in placed_sized:
             open_rows.setdefault(r["task"], []).append(r)
     top = {r["task"]: r["m"] for r in db.execute("select task, max(seq) m from sessions group by task")}
     for task in set(blocks) | set(open_rows):
         new = sorted(blocks.get(task, []), key=lambda x: (x[0], x[1]["start"]))
-        old = open_rows.get(task, [])
+        old = [r for r in open_rows.get(task, []) if not r["user_min"]]
         for i, (date, b) in enumerate(new):
             length = minutes(b)
             if i < len(old):
@@ -269,41 +303,21 @@ def match_sessions(db, schedule: list[dict], now: dt.datetime) -> None:
                            "status, block) values (?, ?, ?, ?, ?, ?, ?, 'planned', ?)",
                            (f"{task}#{top[task]}", task, top[task], date, b["start"], b["end"],
                             length, json.dumps(b)))
-        for r in old[len(new):]:
+        # open sessions the new plan has no block for, including a resized one it could
+        # not fit any more
+        for r in old[len(new):] + [r for r in open_rows.get(task, []) if r["user_min"]]:
             db.execute("update sessions set status = 'cancelled' where id = ?", (r["id"],))
 
 
 # ---------- calendar ---------------------------------------------------------
 def desired_events(db, resolved: list[dict], today: dt.date) -> dict:
+    """What "F26 Plan" should hold: only warnings. The blocks and deadlines are Could Do
+    rows, which Notion Calendar shows and Zach edits."""
     want: dict[str, dict] = {}
-    last: dict[str, str] = {}
-    for r in db.execute("select * from sessions where status in ('planned', 'done') "
-                        "and off_plan = 0 and date >= ? order by date, start", (str(today),)):
-        b = json.loads(r["block"])
-        last[r["task"]] = r["date"]
-        lines = [f"Really due {b['due']}"]
-        if b.get("note"):
-            lines.append(b["note"])
-        if b.get("overflow"):
-            lines.append("Evening overflow: the deadline needs it.")
-        want[r["id"]] = gcal.keyed(r["id"], {
-            "summary": f"{b['course']} · {b['title']}",
-            "description": "\n".join(lines),
-            "start": {"dateTime": f"{r['date']}T{r['start']}:00", "timeZone": gcal.TZ},
-            "end": {"dateTime": f"{r['date']}T{r['end']}:00", "timeZone": gcal.TZ},
-            "transparency": "opaque",
-        })
     all_day = lambda d: {"start": {"date": str(d)}, "end": {"date": str(d + dt.timedelta(days=1))},
                          "transparency": "transparent"}
     for t in resolved:
         due = dt.datetime.strptime(t["orig_due"], "%Y-%m-%d %H:%M")
-        if t["kind"] == "work" and due.date() >= today and t["status"] != "dropped":
-            note = (f"Last planned session {dt.date.fromisoformat(last[t['id']]):%a %b %d}, "
-                    f"{(due.date() - dt.date.fromisoformat(last[t['id']])).days} days before."
-                    if t["id"] in last else "No session left to plan.")
-            want[f"due|{t['id']}"] = gcal.keyed(f"due|{t['id']}", {
-                "summary": f"⚑ Due {due:%H:%M}: {t['course']} {t['title']}",
-                "description": f"Real deadline. {note}", **all_day(due.date())})
         if t["status"] == "awaiting" and due <= dt.datetime.combine(today, dt.time(23, 59)):
             want[f"overdue|{t['id']}"] = gcal.keyed(f"overdue|{t['id']}", {
                 "summary": f"⚠ Not checked off: {t['course']} {t['title']}",
@@ -312,8 +326,9 @@ def desired_events(db, resolved: list[dict], today: dt.date) -> dict:
         if t["status"] == "overdue":
             want[f"overdue|{t['id']}"] = gcal.keyed(f"overdue|{t['id']}", {
                 "summary": f"⚠ Overdue, no longer scheduled: {t['course']} {t['title']}",
-                "description": f"Was due {t['orig_due']}. Mark it Late OK in Notion to keep "
-                               "working on it, or check it off if it is done.", **all_day(today)})
+                "description": f"Was due {t['orig_due']}. Set its Plan state to Late OK in Could "
+                               "Do to keep working on it, or check it off if it is done.",
+                **all_day(today)})
     return want
 
 

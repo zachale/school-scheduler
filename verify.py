@@ -9,8 +9,9 @@
 Windows are checked against resolved_tasks.json (the planner's effective windows
 after unavailability is applied) AND against each task's original due date, which
 is the hard limit no adjustment may cross. Work Zach marked Late OK is the one
-exception. Blocks already started ("pinned") are history: they count toward totals,
-caps and breaks, but are not re-judged against today's calendar.
+exception. Blocks already started, and blocks Zach moved himself ("pinned"; moved ones
+are also "locked"), are his: they count toward totals and caps, but are not re-judged.
+A block he resized ("sized") keeps whatever length he gave it.
 """
 import datetime as dt, json, sys
 from collections import defaultdict
@@ -84,7 +85,7 @@ for day in sched:
         continue
 
     for ws, we, wb in work:
-        if we - ws > S["default_max_minutes"] + 15:   # 15 min tolerance absorbs a sliver
+        if we - ws > S["default_max_minutes"] + 15 and not wb.get("sized"):   # 15 min: a sliver
             fails.append(f"{date} session too long: {wb['title']} {wb['start']}-{wb['end']} "
                          f"({(we-ws)/60:.1f} h > {S['default_max_minutes']/60:.0f} h)")
         for fs, fe, fb in fixed:
@@ -125,7 +126,7 @@ for day in sched:
     run, prev_end = 0, None
     for ws, we, wb in sorted(allwork, key=lambda x: x[0]):
         if prev_end is not None and ws - prev_end < BRK:
-            if run >= BRK_AFTER:
+            if run >= BRK_AFTER and not wb.get("pinned"):   # his own blocks are his call
                 fails.append(f"{date} no break: {wb['title']} starts {wb['start']} after "
                              f"{run} min of continuous work")
             run += we - ws
@@ -180,9 +181,13 @@ for day in sched:
         if not any(ts == ce and te - ts == TRAV for ts, te in trav):
             fails.append(f"{date} no {TRAV} min travel after {ce//60:02d}:{ce%60:02d}")
 
-    if sum(e - s for s, e, b in allwork if not b["overflow"]) > S["max_core_hours_per_day"] * 60 + 1:
+    # a day he filled past the cap himself is his call; the planner may not add to it
+    planner_work = any(not b.get("locked") for _, _, b in allwork)
+    if planner_work and sum(e - s for s, e, b in allwork if not b["overflow"]) > \
+            S["max_core_hours_per_day"] * 60 + 1 and any(not b.get("locked") and not b["overflow"]
+                                                         for _, _, b in allwork):
         fails.append(f"{date} core cap exceeded")
-    if wmin > S["max_total_hours_per_day"] * 60 + 1:
+    if planner_work and wmin > S["max_total_hours_per_day"] * 60 + 1:
         fails.append(f"{date} total cap exceeded: {wmin/60:.1f} h")
 
 # every task's remaining minutes fully scheduled
@@ -260,7 +265,8 @@ if EF:
     last = {}
     for day in sched:
         for b in day["work"]:
-            last[b["task"]] = max(last.get(b["task"], day["date"]), day["date"])
+            if not b.get("locked"):           # where he put a block himself is his call
+                last[b["task"]] = max(last.get(b["task"], day["date"]), day["date"])
     short_buf = []
     for tid, tk in tasks.items():
         if tk["kind"] not in set(ef.get("kinds", ["work"])) or tid not in last or tk["late"]:
