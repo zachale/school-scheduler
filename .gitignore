@@ -1,0 +1,7 @@
+# Produced on the VM by service.py; local copies are only previews
+busy.json
+state.json
+schedule.json
+resolved_tasks.json
+calendar.html
+__pycache__/

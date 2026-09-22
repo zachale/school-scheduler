@@ -1,0 +1,15 @@
+[Unit]
+Description=F26 autoplanner (keeps the F26 Plan calendar current)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Environment=TZ=America/Toronto
+WorkingDirectory=%h/f26-planner
+ExecStart=%h/.local/bin/uv run --quiet %h/f26-planner/service.py
+Restart=always
+RestartSec=30
+MemoryMax=400M
+
+[Install]
+WantedBy=default.target
