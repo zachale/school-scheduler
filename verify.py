@@ -203,17 +203,20 @@ for day in sched:
     for b in day["work"]:
         g = tasks[b["task"]].get("spread_group") if b["task"] in tasks else None
         if g:
-            groups[g].append(dt.date.fromisoformat(day["date"]))
-for t in resolved:              # posts already finished still count toward the spacing
+            groups[g].append((dt.date.fromisoformat(day["date"]), True))
+for t in resolved:              # posts already finished still hold the next one back
     if t["status"] == "finished" and t.get("spread_group"):
-        groups[t["spread_group"]].append(dt.date.fromisoformat(t["finished_on"]))
+        groups[t["spread_group"]].append((dt.date.fromisoformat(t["finished_on"]), False))
 bad_spread = []
 for g, ds in sorted(groups.items()):
     u = sorted(set(ds))
-    if len(u) != len(ds):
-        bad_spread.append(f"{g}: {len(ds)} posts on {len(u)} days")
-    if any((b - a).days < 2 for a, b in zip(u, u[1:])):
-        bad_spread.append(f"{g}: posts closer than 2 days ({', '.join(f'{d:%b %d}' for d in u)})")
+    planned = [d for d, live in u if live]
+    if len(planned) != len({d for d, live in u if live}):
+        bad_spread.append(f"{g}: two posts planned for the same day")
+    for (a, la), (b, lb) in zip(u, u[1:]):
+        if (b - a).days < 2 and (la or lb):       # a pair of finished posts is history
+            bad_spread.append(f"{g}: posts closer than 2 days "
+                              f"({a:%b %d} and {b:%b %d})")
 fails += bad_spread
 
 # catch-up exists for every course that lost a lecture to a write-off
@@ -225,7 +228,7 @@ for d in blocked:
     for c in cfg["classes"]:
         if not c.get("skip") and wd in c["days"] and d <= cfg["term"]["last_class_day"]:
             missed.add(c["course"])
-have_cu = {t["course"] for t in tasks.values() if t["kind"] == "catchup"}
+have_cu = {t["course"] for t in resolved if t["kind"] == "catchup"}
 
 check(not short, f"all {len(tasks)} tasks fully scheduled ({sum(done.values())/60:.1f} h)")
 check(not any("before the plan start" in f for f in fails),

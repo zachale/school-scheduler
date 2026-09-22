@@ -29,6 +29,8 @@ TZ = "America/Toronto"
 KEY = Path(os.environ.get("F26_GOOGLE_KEY", "~/.config/f26-planner/google-key.json")).expanduser()
 BATCH = 50                     # Calendar's recommended ceiling per batch request
 RETRIES = 6
+RETRY_REASONS = {"rateLimitExceeded", "userRateLimitExceeded", "quotaExceeded",
+                 "backendError", "internalError", "variableTermLimitExceeded"}
 
 
 class CalendarError(RuntimeError):
@@ -74,10 +76,25 @@ def fetch_busy(svc, calendars: list[str], start: dt.date, end: dt.date) -> list[
     return [{"date": a, "start": b, "end": c} for a, b, c in sorted(seen)]
 
 
+def event_id(key: str) -> str:
+    """A stable Calendar event id for a key: base32hex characters only, so a retried
+    insert that Google already committed comes back as 409 instead of duplicating."""
+    return "f26" + hashlib.sha1(key.encode()).hexdigest()[:26]
+
+
 def keyed(key: str, body: dict) -> dict:
     """Stamp an event body with its stable key and a hash of its content."""
     digest = hashlib.sha1(json.dumps(body, sort_keys=True).encode()).hexdigest()[:16]
-    return {**body, "extendedProperties": {"private": {"f26": key, "f26hash": digest}}}
+    return {**body, "id": event_id(key),
+            "extendedProperties": {"private": {"f26": key, "f26hash": digest}}}
+
+
+def _reason(exc: HttpError) -> str:
+    try:
+        errors = json.loads(exc.content)["error"].get("errors") or [{}]
+        return errors[0].get("reason", "")
+    except Exception:
+        return ""
 
 
 def existing(svc, cid: str, since: dt.date) -> dict[str, list[dict]]:
@@ -98,8 +115,9 @@ def existing(svc, cid: str, since: dt.date) -> dict[str, list[dict]]:
 
 
 def _batch(svc, calls: list, label: str) -> None:
-    """Run request factories in batches, retrying rate-limited and server errors with
-    backoff. A delete of an event that is already gone counts as done."""
+    """Run request factories in batches. Rate limits and server errors are retried with
+    backoff; a delete of an event that is already gone, and an insert of one that already
+    exists (the same write, retried), both resolve without duplicating anything."""
     pending, delay = list(calls), 2
     for _ in range(RETRIES):
         retry = []
@@ -108,25 +126,27 @@ def _batch(svc, calls: list, label: str) -> None:
             errors: dict[str, HttpError] = {}
             batch = svc.new_batch_http_request(
                 callback=lambda rid, _resp, exc: errors.__setitem__(rid, exc) if exc else None)
-            for j, (make, _) in enumerate(chunk):
-                batch.add(make(), request_id=str(j))
+            for j, call in enumerate(chunk):
+                batch.add(call["make"](), request_id=str(j))
             batch.execute()
-            for j, (make, is_delete) in enumerate(chunk):
+            for j, call in enumerate(chunk):
                 exc = errors.get(str(j))
                 if exc is None:
                     continue
-                status = exc.resp.status
-                if is_delete and status in (404, 410):
+                status, reason = exc.resp.status, _reason(exc)
+                if call["kind"] == "delete" and status in (404, 410):
                     continue
-                if status in (403, 429, 500, 502, 503):
-                    retry.append((make, is_delete))
+                if call["kind"] == "insert" and status == 409 and call.get("instead"):
+                    retry.append({"make": call["instead"], "kind": "update"})
+                elif status in (429, 500, 502, 503) or (status == 403 and reason in RETRY_REASONS):
+                    retry.append(call)
                 else:
-                    raise CalendarError(f"{label}: {status} {exc}")
+                    raise CalendarError(f"{label}: {status} {reason or exc}")
         if not retry:
             return
         pending = retry
         time.sleep(delay)
-        delay *= 2
+        delay = min(delay * 2, 30)
     raise CalendarError(f"{label}: {len(pending)} writes still failing after retries")
 
 
@@ -139,9 +159,33 @@ def apply(svc, cid: str, want: dict[str, dict], since: dt.date, dry_run: bool) -
     delete = [ev for k, evs in have.items() for ev in (evs if k not in want else evs[1:])]
     if not dry_run:
         ev = svc.events()
-        _batch(svc, [(lambda k=k: ev.insert(calendarId=cid, body=want[k]), False) for k in add]
-               + [(lambda k=k: ev.update(calendarId=cid, eventId=have[k][0]["id"], body=want[k]),
-                   False) for k in update]
-               + [(lambda e=e: ev.delete(calendarId=cid, eventId=e["id"]), True) for e in delete],
-               "calendar writes")
+        _batch(svc,
+               [{"kind": "insert", "make": lambda k=k: ev.insert(calendarId=cid, body=want[k]),
+                 "instead": lambda k=k: ev.update(calendarId=cid, eventId=event_id(k),
+                                                  body=want[k])} for k in add]
+               + [{"kind": "update",
+                   "make": lambda k=k: ev.update(calendarId=cid, eventId=have[k][0]["id"],
+                                                 body=want[k])} for k in update]
+               + [{"kind": "delete", "make": lambda e=e: ev.delete(calendarId=cid,
+                                                                   eventId=e["id"])}
+                  for e in delete], "calendar writes")
     return len(add), len(update), len(delete), len(want) - len(add) - len(update)
+
+
+def alert(svc, cid: str, key: str, body: dict | None) -> None:
+    """Put one alert event on the calendar, or take it away, without touching anything
+    else. Used when the plan itself could not be rebuilt."""
+    ev = svc.events()
+    found = ev.list(calendarId=cid, privateExtendedProperty=f"f26={key}", showDeleted=False,
+                    maxResults=10).execute(num_retries=RETRIES).get("items", [])
+    try:
+        if body is None:
+            for e in found:
+                ev.delete(calendarId=cid, eventId=e["id"]).execute(num_retries=RETRIES)
+        elif found:
+            ev.update(calendarId=cid, eventId=found[0]["id"], body=body).execute(num_retries=RETRIES)
+        else:
+            ev.insert(calendarId=cid, body=body).execute(num_retries=RETRIES)
+    except HttpError as e:
+        if e.resp.status not in (404, 409, 410):
+            raise

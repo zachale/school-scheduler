@@ -334,7 +334,7 @@ def apply_state(tasks: list[dict], state: dict):
 
 
 def resolve_windows(cfg: dict, tasks: list[dict], blocked: dict, now: dt.datetime,
-                    late_ok: set[str]):
+                    late_ok: set[str], seeded: dict[str, list[dt.date]]):
     """Resolve each task's real window against the days actually available and the
     current time. Returns the tasks to schedule, the overdue tasks left unscheduled,
     and a human-readable list of what changed."""
@@ -347,15 +347,25 @@ def resolve_windows(cfg: dict, tasks: list[dict], blocked: dict, now: dt.datetim
             d -= dt.timedelta(days=1)
         return d
 
+    end_of_day = hm(cfg["work_hours"]["overflow"][1])
+
     def soonest_finish(start: dt.date, minutes: int) -> dt.datetime:
-        """The earliest a task could be done if begun on `start`, at ~5 h a day."""
-        need, d = max(1, math.ceil(minutes / 300)), start
+        """The earliest a task could be done if begun on `start`, at ~5 h a day. Today
+        counts only the hours that are actually left."""
+        d, left = start, minutes
+        if d == today:
+            hours_left = max(0, end_of_day - (now.hour * 60 + now.minute))
+            left -= min(left, hours_left)
+            if left <= 0:
+                return dt.datetime.combine(d, dt.time(end_of_day // 60, end_of_day % 60))
+            d += dt.timedelta(days=1)
         while not avail(d):
             d += dt.timedelta(days=1)
-        while need > 1:
+        while left > 300:
+            left -= 300
             d += dt.timedelta(days=1)
-            if avail(d):
-                need -= 1
+            while not avail(d):
+                d += dt.timedelta(days=1)
         return dt.datetime.combine(d, dt.time(22, 0))
 
     live, overdue = [], []
@@ -413,6 +423,7 @@ def resolve_windows(cfg: dict, tasks: list[dict], blocked: dict, now: dt.datetim
                                    t["minutes"] - t["_done"] - t["_pinned"])
             new = max(target, floor)
             if new < t["_due"]:
+                t["_hard_due"] = t["_due"]        # fall back to this if N days early cannot fit
                 t["_due"] = new
             t["_buffer_days"] = (t["_orig_due"].date() - t["_due"].date()).days
 
@@ -423,7 +434,10 @@ def resolve_windows(cfg: dict, tasks: list[dict], blocked: dict, now: dt.datetim
             groups.setdefault(t["spread_group"], []).append(t)
     for gid, members in groups.items():
         members.sort(key=lambda t: t["id"])
+        gap = max((t.get("min_gap_days", 1) for t in members), default=1)
         lo = max(min(t["_earliest"] for t in members), today)
+        if seeded.get(gid):          # posts already done hold the next one back
+            lo = max(lo, max(seeded[gid]) + dt.timedelta(days=gap))
         hi = max(t["_due"] for t in members)
         days = [lo + dt.timedelta(days=i) for i in range((hi.date() - lo).days + 1)]
         days = [d for d in days if avail(d)]
@@ -448,149 +462,164 @@ def schedule(cfg: dict, tasks: list[dict], events: list[dict], busy: list[dict],
     parse_tasks(tasks)
     changes = add_catchups(cfg, tasks, blocked)
     tasks, finished = apply_state(tasks, state)
+    seeded: dict[str, list[dt.date]] = {}
+    for t in finished:               # a post that was dropped never happened
+        if t.get("spread_group") and t["_status"] == "finished":
+            seeded.setdefault(t["spread_group"], []).append(t["_finished_on"])
     live, overdue, more = resolve_windows(cfg, tasks, blocked, now,
-                                          set(state.get("late_ok") or []))
+                                          set(state.get("late_ok") or []), seeded)
     changes += more
     tasks = live
-    days = [Day(d0 + dt.timedelta(days=i), cfg, events, blocked, busy)
-            for i in range((d1 - d0).days + 1)]
-    # today: nothing new before now, and the blocks already started stay put
-    if days and days[0].date == now.date():
-        days[0].not_before = now.hour * 60 + now.minute
-        for b in state.get("pinned") or []:
-            days[0].blocks.append({**b, "start": hm(b["start"]), "end": hm(b["end"]),
-                                   "pinned": True})
-        S = cfg["sessions"]
-        brk, brk_after = S.get("break_minutes", 15), S.get("break_after_minutes", 90)
-        for b in days[0].blocks:             # a long started session still earns its break
-            if days[0].run_before(b["end"], brk) >= brk_after:
-                days[0].fixed.append({"start": b["end"], "end": b["end"] + brk,
-                                      "title": "Break", "cat": "Break"})
+    def build_days():
+        days = [Day(d0 + dt.timedelta(days=i), cfg, events, blocked, busy)
+                for i in range((d1 - d0).days + 1)]
+        # today: nothing new before now, and the blocks already started stay put
+        if days and days[0].date == now.date():
+            days[0].not_before = now.hour * 60 + now.minute
+            for b in state.get("pinned") or []:
+                days[0].blocks.append({**b, "start": hm(b["start"]), "end": hm(b["end"]),
+                                       "pinned": True})
+            brk, brk_after = S.get("break_minutes", 15), S.get("break_after_minutes", 90)
+            for b in days[0].blocks:         # a long started session still earns its break
+                if days[0].run_before(b["end"], brk) >= brk_after:
+                    days[0].fixed.append({"start": b["end"], "end": b["end"] + brk,
+                                          "title": "Break", "cat": "Break"})
+        return days
 
     S = cfg["sessions"]
     core_cap = int(S["max_core_hours_per_day"] * 60)
     total_cap = int(S["max_total_hours_per_day"] * 60)
     exam_cap = int(S.get("exam_day_max_hours", S["max_total_hours_per_day"]) * 60)
 
-    for t in tasks:
-        t["remaining"] = t["minutes"] - t["_done"] - t["_pinned"]
+    def attempt(days):
+        for t in tasks:
+            t["remaining"] = t["minutes"] - t["_done"] - t["_pinned"]
 
-    def latest_start(t, today):
-        """Latest date this task can begin and still finish at ~5 h/day,
-        counting only days that are actually available."""
-        need = max(1, math.ceil(t["remaining"] / 300))
-        d = t["_due"].date()
-        while need > 0 and d > today:
-            d -= dt.timedelta(days=1)
-            if d not in blocked:
-                need -= 1
-        return d
+        def latest_start(t, today):
+            """Latest date this task can begin and still finish at ~5 h/day,
+            counting only days that are actually available."""
+            need = max(1, math.ceil(t["remaining"] / 300))
+            d = t["_due"].date()
+            while need > 0 and d > today:
+                d -= dt.timedelta(days=1)
+                if d not in blocked:
+                    need -= 1
+            return d
 
-    unplaced: list[dict] = []
-    # discussion posts already finished still count toward the spacing rule
-    group_days: dict[str, list[dt.date]] = {}
-    for t in finished:
-        if t.get("spread_group"):
-            group_days.setdefault(t["spread_group"], []).append(t["_finished_on"])
+        unplaced: list[dict] = []
+        # discussion posts already finished still count toward the spacing rule
+        group_days: dict[str, list[dt.date]] = {k: list(v) for k, v in seeded.items()}
 
-    # Per day, two passes: core hours with any live task, then evening overflow
-    # for pressed work only. An exam day is capped lower and never runs into the
-    # evening. (A lower "comfortable target" tier was tried and removed: every
-    # target below the core cap pushed work into evenings and worsened peak days.)
-    for day in days:
-        exam_day = any(b.get("cat") == "Exam" for b in day.fixed)
-        passes = [(False, core_cap, False), (True, total_cap, True)]
-        for overflow, cap, pressed_only in passes:
-            if exam_day:
-                if overflow:
-                    continue
-                cap = min(cap, exam_cap)
-            while True:
-                slots = day.slots(overflow)
-                if not slots:
-                    break
-                used = day.worked()
-                if used >= cap:
-                    break
+        # Per day, two passes: core hours with any live task, then evening overflow
+        # for pressed work only. An exam day is capped lower and never runs into the
+        # evening. (A lower "comfortable target" tier was tried and removed: every
+        # target below the core cap pushed work into evenings and worsened peak days.)
+        for day in days:
+            exam_day = any(b.get("cat") == "Exam" for b in day.fixed)
+            passes = [(False, core_cap, False), (True, total_cap, True)]
+            for overflow, cap, pressed_only in passes:
+                if exam_day:
+                    if overflow:
+                        continue
+                    cap = min(cap, exam_cap)
+                while True:
+                    slots = day.slots(overflow)
+                    if not slots:
+                        break
+                    used = day.worked()
+                    if used >= cap:
+                        break
 
-                def spread_ok(t):
-                    gid = t.get("spread_group")
-                    if not gid:
-                        return True
-                    gap = t.get("min_gap_days", 1)
-                    return all(abs((day.date - d).days) >= gap
-                               for d in group_days.get(gid, []))
+                    def spread_ok(t):
+                        gid = t.get("spread_group")
+                        if not gid:
+                            return True
+                        gap = t.get("min_gap_days", 1)
+                        return all(abs((day.date - d).days) >= gap
+                                   for d in group_days.get(gid, []))
 
-                live = [t for t in tasks
-                        if t["remaining"] > 0
-                        and t["_earliest"] <= day.date
-                        and t["_due"].date() >= day.date
-                        and spread_ok(t)]
-                if not live:
-                    break
-                # past the comfortable target, only work that is actually pressed
-                if pressed_only:
-                    live = [t for t in live if latest_start(t, day.date) <= day.date]
+                    live = [t for t in tasks
+                            if t["remaining"] > 0
+                            and t["_earliest"] <= day.date
+                            and t["_due"].date() >= day.date
+                            and spread_ok(t)]
                     if not live:
                         break
-                live.sort(key=lambda t: (latest_start(t, day.date), t["_due"], -t["remaining"]))
+                    # past the comfortable target, only work that is actually pressed
+                    if pressed_only:
+                        live = [t for t in live if latest_start(t, day.date) <= day.date]
+                        if not live:
+                            break
+                    live.sort(key=lambda t: (latest_start(t, day.date), t["_due"], -t["remaining"]))
 
-                placed = False
-                for t in live:
-                    # on the due date itself, nothing may run past the due time
-                    cutoff = (t["_due"].hour * 60 + t["_due"].minute
-                              if t["_due"].date() == day.date else 24 * 60)
-                    for si, (s, e) in enumerate(sorted(slots)):
-                        e = min(e, cutoff)
-                        if e - s < 20:
-                            continue
-                        room = int(min(e - s, cap - used))
-                        chunk = int(min(t["remaining"], t["max_minutes"], room))
-                        if chunk < min(t["min_minutes"], t["remaining"]):
-                            continue
-                        # never leave a sliver of a task behind: absorb a leftover under
-                        # 20 min into this session, allowing up to 15 min past the max
-                        if 0 < t["remaining"] - chunk < 20:
-                            if t["remaining"] <= min(room, t["max_minutes"] + 15):
-                                chunk = t["remaining"]
-                            else:
-                                chunk = t["remaining"] - 20   # leave a real session instead
-                        brk_after = S.get("break_after_minutes", 90)
-                        brk = S.get("break_minutes", 15)
-                        if day.run_before(s, brk) + chunk >= brk_after:
-                            day.fixed.append({"start": s + chunk, "end": s + chunk + brk,
-                                              "title": "Break", "cat": "Break"})
-                        day.blocks.append({
-                            "start": s, "end": s + chunk, "title": t["title"],
-                            "cat": t["course"], "course": t["course"], "task": t["id"],
-                            "kind": t["kind"], "overflow": overflow,
-                            "due": t["due"], "note": t.get("note", ""),
-                        })
-                        t["remaining"] -= chunk
-                        if t.get("spread_group") and t["remaining"] == 0:
-                            group_days.setdefault(t["spread_group"], []).append(day.date)
-                        placed = True
+                    placed = False
+                    for t in live:
+                        # on the due date itself, nothing may run past the due time
+                        cutoff = (t["_due"].hour * 60 + t["_due"].minute
+                                  if t["_due"].date() == day.date else 24 * 60)
+                        for si, (s, e) in enumerate(sorted(slots)):
+                            e = min(e, cutoff)
+                            if e - s < 20:
+                                continue
+                            room = int(min(e - s, cap - used))
+                            chunk = int(min(t["remaining"], t["max_minutes"], room))
+                            if chunk < min(t["min_minutes"], t["remaining"]):
+                                continue
+                            # never leave a sliver of a task behind: absorb a leftover under
+                            # 20 min into this session, allowing up to 15 min past the max
+                            if 0 < t["remaining"] - chunk < 20:
+                                if t["remaining"] <= min(room, t["max_minutes"] + 15):
+                                    chunk = t["remaining"]
+                                else:
+                                    chunk = t["remaining"] - 20   # leave a real session instead
+                            brk_after = S.get("break_after_minutes", 90)
+                            brk = S.get("break_minutes", 15)
+                            if day.run_before(s, brk) + chunk >= brk_after:
+                                day.fixed.append({"start": s + chunk, "end": s + chunk + brk,
+                                                  "title": "Break", "cat": "Break"})
+                            day.blocks.append({
+                                "start": s, "end": s + chunk, "title": t["title"],
+                                "cat": t["course"], "course": t["course"], "task": t["id"],
+                                "kind": t["kind"], "overflow": overflow,
+                                "due": t["due"], "note": t.get("note", ""),
+                            })
+                            t["remaining"] -= chunk
+                            if t.get("spread_group") and t["remaining"] == 0:
+                                group_days.setdefault(t["spread_group"], []).append(day.date)
+                            placed = True
+                            break
+                        if placed:
+                            break
+                    if not placed:
                         break
-                    if placed:
-                        break
-                if not placed:
-                    break
-        day.blocks.sort(key=lambda b: b["start"])
-        # merge back-to-back sessions of the same task into one readable block
-        merged: list[dict] = []
-        for b in day.blocks:
-            if (merged and merged[-1]["task"] == b["task"] and merged[-1]["end"] == b["start"]
-                    and merged[-1]["overflow"] == b["overflow"]
-                    and not merged[-1].get("pinned") and not b.get("pinned")
-                    and b["end"] - merged[-1]["start"] <= S["default_max_minutes"]):
-                merged[-1]["end"] = b["end"]
-            else:
-                merged.append(b)
-        day.blocks = merged
+            day.blocks.sort(key=lambda b: b["start"])
+            # merge back-to-back sessions of the same task into one readable block
+            merged: list[dict] = []
+            for b in day.blocks:
+                if (merged and merged[-1]["task"] == b["task"] and merged[-1]["end"] == b["start"]
+                        and merged[-1]["overflow"] == b["overflow"]
+                        and not merged[-1].get("pinned") and not b.get("pinned")
+                        and b["end"] - merged[-1]["start"] <= S["default_max_minutes"]):
+                    merged[-1]["end"] = b["end"]
+                else:
+                    merged.append(b)
+            day.blocks = merged
 
-    for t in tasks:
-        if t["remaining"] > 0:
-            unplaced.append(t)
+        return [t for t in tasks if t["remaining"] > 0]
+
+    days = build_days()
+    unplaced = attempt(days)
+    if unplaced:
+        # an early-finish target that cannot be met is a preference, not a deadline
+        relaxed = False
+        for t in unplaced:
+            if t.get("_hard_due") and t["_hard_due"] > t["_due"]:
+                changes.append(f"{t['course']} {t['title']}: cannot finish "
+                               f"{t['_buffer_days']} days early, using its real deadline")
+                t["_due"], t["_buffer_days"], relaxed = t["_hard_due"], None, True
+        if relaxed:
+            days = build_days()
+            unplaced = attempt(days)
     return days, unplaced, tasks, overdue, finished, changes
 
 

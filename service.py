@@ -42,10 +42,12 @@ APP = Path(__file__).resolve().parent
 STATE = Path("~/.local/state/f26-planner").expanduser()
 WORK = STATE / "work"
 INPUTS = ["config.yaml", "tasks.yaml", "events.yaml", "plan.py", "verify.py"]
+# everything that can change what ends up on the calendar
+WATCHED = INPUTS + ["service.py", "gcal.py", "gcal.json"]
 TZ = ZoneInfo("America/Toronto")
 CYCLE_SECONDS = 60
-ROLLOVER = dt.time(0, 5)
 ALERT_AFTER = 5            # consecutive failed cycles before an alert event
+ALERT_KEY = "alert"
 
 
 def log(msg: str) -> None:
@@ -97,17 +99,20 @@ def minutes(row) -> int:
     return h(row["end"]) - h(row["start"])
 
 
-def rollover(db, now: dt.datetime) -> bool:
-    """At 00:05, yesterday's sessions become history. Returns True if it ran."""
+def rollover(db, now: dt.datetime, commit: bool = True) -> bool:
+    """Once the day turns, the sessions left on earlier days become history. Returns
+    True if it ran. Sessions already marked missed are left alone: they are the way to
+    say "that block did not happen", and their minutes go back into the plan."""
     today = str(now.date())
-    if kv(db, "rolled_over") == today or now.time() < ROLLOVER:
+    if kv(db, "rolled_over") == today:
         return False
     # no done signal yet (Notion arrives in M3): a passed session is assumed done
     n = db.execute("update sessions set status = 'done' where status = 'planned' and date < ?",
                    (today,)).rowcount
     set_kv(db, "rolled_over", today)
-    db.commit()
-    log(f"rollover {today}: {n} sessions from earlier days recorded as done")
+    if commit:
+        db.commit()
+        log(f"rollover {today}: {n} sessions from earlier days recorded as done")
     return True
 
 
@@ -127,7 +132,7 @@ def planner_state(db, now: dt.datetime) -> dict:
 # ---------- planning ---------------------------------------------------------
 def fingerprint(busy: list[dict], state: dict) -> str:
     h = hashlib.sha256()
-    for name in INPUTS:
+    for name in WATCHED:
         h.update((APP / name).read_bytes())
     h.update(json.dumps(busy, sort_keys=True).encode())
     # what the plan depends on besides the inputs: the day, and which sessions are history
@@ -193,7 +198,7 @@ def match_sessions(db, schedule: list[dict], now: dt.datetime) -> None:
 
 
 # ---------- calendar ---------------------------------------------------------
-def desired_events(db, resolved: list[dict], today: dt.date, alerts: list[str]) -> dict:
+def desired_events(db, resolved: list[dict], today: dt.date) -> dict:
     want: dict[str, dict] = {}
     last: dict[str, str] = {}
     for r in db.execute("select * from sessions where status in ('planned', 'done') "
@@ -228,10 +233,30 @@ def desired_events(db, resolved: list[dict], today: dt.date, alerts: list[str]) 
                 "summary": f"⚠ Overdue, no longer scheduled: {t['course']} {t['title']}",
                 "description": f"Was due {t['orig_due']}. Mark it Late OK in Notion to keep "
                                "working on it, or check it off if it is done.", **all_day(today)})
-    for i, a in enumerate(alerts):
-        want[f"alert|{i}"] = gcal.keyed(f"alert|{i}", {
-            "summary": "⚠ Planner stalled", "description": a, **all_day(today)})
     return want
+
+
+def raise_alert(db, svc, now: dt.datetime, why: str) -> None:
+    """Show one all-day "Planner stalled" event, dated today, and keep it current."""
+    if kv(db, "alert") == [str(now.date()), why]:
+        return
+    body = gcal.keyed(ALERT_KEY, {
+        "summary": "⚠ Planner stalled", "description": f"{why}\n\nSince {now:%a %b %d %H:%M}.",
+        "start": {"date": str(now.date())},
+        "end": {"date": str(now.date() + dt.timedelta(days=1))}, "transparency": "transparent"})
+    gcal.alert(svc, calendar_id(), ALERT_KEY, body)
+    set_kv(db, "alert", [str(now.date()), why])
+    db.commit()
+    log(f"alert raised: {why.splitlines()[0]}")
+
+
+def clear_alert(db, svc) -> None:
+    if kv(db, "alert") is None:
+        return
+    gcal.alert(svc, calendar_id(), ALERT_KEY, None)
+    set_kv(db, "alert", None)
+    db.commit()
+    log("alert cleared")
 
 
 def calendar_id() -> str:
@@ -240,35 +265,37 @@ def calendar_id() -> str:
 
 # ---------- the cycle --------------------------------------------------------
 def cycle(db, svc, dry_run: bool) -> None:
-    now = round_up(local_now())
-    forced = rollover(db, now) if not dry_run else False
+    clock = local_now()
+    # never round past midnight: today's sessions must stay today's
+    now = min(round_up(clock), clock.replace(hour=23, minute=59))
+    forced = rollover(db, now, commit=not dry_run)
     cfg = yaml.safe_load((APP / "config.yaml").read_text())
     busy = gcal.fetch_busy(svc, cfg["google_calendar"]["read_busy_from"], now.date(),
                            cfg["term"]["plan_until"] + dt.timedelta(days=1))
     state = planner_state(db, now)
     fp = fingerprint(busy, state)
     if fp == kv(db, "fingerprint") and not forced and not dry_run:
+        clear_alert(db, svc)          # a quiet cycle is also a recovered one
         return
     try:
         schedule, resolved = run_planner(busy, state)
     except PlannerError as e:
-        # a plan that fails its checks is never written; say so on the calendar now
+        # the last good plan stays on the calendar untouched; the alert is added beside it
         log(str(e))
         if not dry_run:
-            # keep the last good plan on the calendar and add the alert beside it
-            gcal.apply(svc, calendar_id(), desired_events(db, kv(db, "resolved", []),
-                                                          now.date(), [str(e)]), now.date(), False)
+            raise_alert(db, svc, now, f"The plan could not be rebuilt:\n{e}")
             set_kv(db, "fingerprint", fp)       # do not retry the same failing input
             db.commit()
         return
     match_sessions(db, schedule, now)
-    want = desired_events(db, resolved, now.date(), [])
+    want = desired_events(db, resolved, now.date())
     counts = gcal.apply(svc, calendar_id(), want, now.date(), dry_run)
     log(f"{now:%a %H:%M} replanned: calendar add {counts[0]} · update {counts[1]} · "
         f"delete {counts[2]} · unchanged {counts[3]}" + (" (dry run)" if dry_run else ""))
     if dry_run:
         db.rollback()
         return
+    clear_alert(db, svc)
     set_kv(db, "fingerprint", fp)
     set_kv(db, "resolved", resolved)
     db.commit()
@@ -297,12 +324,9 @@ def main() -> None:
             set_kv(db, "failures", n)
             db.commit()
             log(f"cycle failed ({n} in a row): {e}\n{traceback.format_exc(limit=3)}")
-            if n == ALERT_AFTER and not args.dry_run:
+            if n >= ALERT_AFTER and not args.dry_run:
                 try:
-                    now = local_now()
-                    gcal.apply(svc, calendar_id(), desired_events(
-                        db, kv(db, "resolved", []), now.date(), [f"{n} failed cycles: {e}"]),
-                        now.date(), False)
+                    raise_alert(db, svc, local_now(), f"{n} failed cycles in a row: {e}")
                 except Exception as e2:
                     log(f"could not raise the alert on the calendar either: {e2}")
         if args.once:

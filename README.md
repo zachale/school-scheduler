@@ -4,11 +4,16 @@ Time-blocks every deliverable across the term, respecting classes, travel, meals
 ad-hoc commitments. Deterministic: same inputs always give the same plan, so adding a
 constraint and re-running reflows everything predictably.
 
+Since 2026-09-22 it runs by itself on the VM (`ssh vm`) as the **autoplanner service**
+([PRD](PRD-autoplanner.md)). Every minute it reads Zach's free/busy; when anything changed it
+replans from now, verifies, and writes only the differences to the "F26 Plan" Google
+Calendar. No LLM is involved.
+
 ```bash
-uv run gcal.py busy             # snapshot busy time on Zach's Google Calendar
-uv run plan.py                  # replan + render
-uv run verify.py                # check the result against every stated constraint
-uv run gcal.py sync             # mirror it into the "F26 Plan" Google Calendar
+deploy/deploy.sh                                   # push code + inputs to the VM, restart
+ssh vm journalctl --user -u f26-planner -f         # watch it work
+ssh vm cat .local/state/f26-planner/calendar.html > /tmp/plan.html   # latest week grid
+ssh vm 'cd f26-planner && ~/.local/bin/uv run service.py --once --dry-run'   # plan + diff only
 ```
 
 ## Files
@@ -18,27 +23,24 @@ uv run gcal.py sync             # mirror it into the "F26 Plan" Google Calendar
 | `config.yaml` | Constraints: work hours, meals, travel, classes, term dates |
 | `tasks.yaml` | The 94 work items with hours, earliest-start and due |
 | `events.yaml` | **Ad-hoc commitments — the file that changes** |
-| `progress.yaml` | What is done: last day accounted for, minutes completed per task |
-| `plan.py` | The scheduler and HTML renderer |
+| `plan.py` | The scheduler and HTML renderer; plans from `state.json`'s "now" |
 | `verify.py` | Independent constraint checker; exits non-zero on violation |
-| `calendar.html` | Week-grid view, Google-Calendar style |
-| `schedule.json` | Machine-readable output |
-| `gcal.py` | Google Calendar link: `busy` reads Zach's busy time, `sync` pushes the plan |
-| `busy.json` | Snapshot of busy time on Zach's calendars (times only, no titles) |
-| `gcal.json` | The "F26 Plan" calendar's id, written by the first sync |
+| `service.py` | The always-on loop on the VM: rollover, free/busy, replan, verify, calendar writes |
+| `gcal.py` | Google Calendar library used by the service (free/busy, batched keyed writes) |
+| `gcal.json` | The "F26 Plan" calendar's id |
+| `deploy/` | systemd user unit and `deploy.sh` |
 | `_gen_tasks.py` | One-off that built `tasks.yaml`; kept for provenance |
 | `PRD-autoplanner.md` | Draft PRD for the no-LLM service that replans on its own |
 
 ## Changing the plan in plain English
 
-Tell Claude what changed and it edits the right file, re-runs, re-verifies, and syncs the
-calendar. The translations are mechanical:
+Tell Claude what changed and it edits the right file and runs `deploy/deploy.sh`; the
+service replans within a minute. The translations are mechanical:
 
 | You say | What changes |
 |---|---|
 | "I have a thing Thursday 6–9pm" | nothing, if it is a Busy event on your calendar; otherwise a row in `events.yaml` |
-| "I didn't do anything today" | `through:` in `progress.yaml` moves to today |
-| "I got 2 h of the MATH 3240 assignment done" | `math3240-a1: 120` under `done:`, and `through:` |
+| "I didn't do today's blocks" | until Notion tracking lands (PRD M3), their sessions are set to `missed` in the VM's `state.db`, which returns the minutes to the task; anything else that has passed is assumed done |
 | "no weekends" | `work_hours.include_weekends: false` |
 | "I can work till 11 on weeknights" | `work_hours.overflow` |
 | "CIS 4020's project is a group project, halve it" | the `minutes` on `cis4020-proj` |
@@ -116,10 +118,11 @@ ENVS*2210 penalises clustering posts into the final 24 hours.
 
 ## Google Calendar sync
 
-`gcal.py sync` mirrors the plan into a dedicated **"F26 Plan"** calendar: every work block,
-plus an all-day ⚑ event on each hand-in's real deadline. Each event carries a stable key and a
-content hash, so a re-run only adds, updates or deletes what changed. Days before the plan
-start are left alone as history. `--dry-run` reports the changes without writing.
+The service mirrors the plan into a dedicated **"F26 Plan"** calendar: every work block,
+plus an all-day ⚑ event on each hand-in's real deadline, plus all-day ⚠ events for overdue
+work and planner failures. Each block has a stable session id (`<task>#<n>`, never reused),
+and each event carries that key and a content hash, so a replan only adds, updates or
+deletes what changed, in batches. Days before today are left alone as history.
 
 How it connects (set up 2026-09-21):
 
@@ -128,13 +131,12 @@ How it connects (set up 2026-09-21):
 - Service account `planner-bot@your-project.iam.gserviceaccount.com` owns the calendar and
   shares it read-only with you@example.com. It has no access to any of Zach's own
   calendars.
-- The script impersonates the service account using the gcloud login already on this machine,
-  so no key file or client secret is stored anywhere. That rests on one grant (Zach ran it
-  2026-09-21):
-  `gcloud iam service-accounts add-iam-policy-binding planner-bot@your-project.iam.gserviceaccount.com --project your-gcp-project --member user:you@example.com --role roles/iam.serviceAccountTokenCreator`
+- On the VM the service authenticates with the robot's key file,
+  `~/.config/f26-planner/google-key.json` (mode 0600, created 2026-09-22, never on the Mac).
+  The earlier token-creator grant that let the Mac impersonate the robot is unused now.
 
 Reading Zach's own calendar (built 2026-09-21). Zach shared his main calendar with the robot
-as **free/busy only**. `gcal.py busy` snapshots its busy time into `busy.json`, and `plan.py`
+as **free/busy only**. The service reads its busy time every minute into `busy.json`, and `plan.py`
 blocks each busy stretch with a 30-minute buffer either side, after removing time it already
 schedules itself: classes, the skipped Friday labs (now listed in `config.yaml` with
 `skip: true`), exams and `events.yaml` rows. `verify.py` fails any work on busy time.
@@ -185,22 +187,21 @@ disagreement is ENVS week 1 reading: Notion ends it Sun Sep 20, the planner Mon 
 
 ## Current state
 
-Progress logged through Mon Sep 21 with nothing done, so the plan runs from Tue Sep 22:
-394.8 h across 76 working days with Oct 5–10 written off and **hand-ins finishing 3 days
-early**. Every hand-in lands at least 3 days before its real deadline. Cost: 19.1 h of
-evening work across the term, busiest day 8.2 h. `verify.py` passes every check.
+**The autoplanner service has been live on the VM since 2026-09-22 09:35.** It holds 216 work
+blocks and 23 ⚑ deadlines on "F26 Plan", each keyed by a session id, and re-runs every minute:
+a changed input or a new busy event reflows the plan within about two minutes. ENVS Reading
+wk1 passed its deadline unchecked, so by the rule Zach chose it is no longer scheduled and
+carries an all-day ⚠ event instead.
 
-Sat Sep 26 is blocked 11:10 onward for a wedding and reception (in `events.yaml`, since
-free/busy cannot see either). Losing that afternoon moved 4.5 h into evenings on Oct 16 and
-Oct 20, the run-up to the Oct 21 midterms. Losing Monday Sep 21 earlier cost 4 h of evenings
-on Oct 22. The scheduler only opens evenings for work that is pressed, so lost time surfaces
-in the pre-midterm crunch.
+The plan itself: 394 h from Tue Sep 22 to Dec 18, Oct 5–10 written off, hand-ins finishing
+3 days early, about 20 h of evening work, busiest day 8.7 h.
 
-Calendar sync is live: "F26 Plan" holds 242 events (219 work blocks, 23 deadlines) under Other
-calendars in you@example.com's Google Calendar. Events take the calendar's own colour;
-Google only shows per-event colours to the calendar owner.
+Two adversarial reviews ran before it went live and found 20 defects, all fixed: a verify
+check that would have frozen the planner from mid-October, double-scheduled work in the
+minutes around midnight, an early-finish target that behaved as a hard deadline, alerts that
+could delete the whole calendar, and retried calendar writes that could duplicate an event.
 
-On the calendar, ⚑ flags sit on each hand-in's **real** deadline, so the gap between the
-last work block and the flag is the buffer.
+Still to come (see [the PRD](PRD-autoplanner.md)): Notion rows for every block and deadline
+(M2), checkbox tracking with resized blocks (M3), and learned estimates (M4).
 
 Hours come from [[fall-2026-effort-estimates]], which carries a +30% buffer.
