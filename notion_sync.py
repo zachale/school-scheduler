@@ -306,11 +306,12 @@ def write(db, nt: notion.Notion, cfg: dict, resolved: list[dict], now: dt.dateti
         if t["id"] in solo:            # its own deliverable row already is its task row
             continue
         plan_id = f"task:{t['id']}"
-        due = dt.datetime.strptime(t["orig_due"], "%Y-%m-%d %H:%M")
         props = {
             "Name": title(f"{t['course']} — {t['title']}"),
             "Plan ID": rich(plan_id),
-            "Due Date": {"date": {"start": str(due.date())}},   # all-day: blocks carry times
+            # no date: a task row is only the parent of its blocks, which carry the times;
+            # the real deadline is on the deliverable row
+            "Due Date": {"date": None},
             "Tags": {"multi_select": [{"name": "School"}, {"name": tags[t["course"]]}]},
             "Plan state": {"select": {"name": "Late OK" if t["late"] else "Planned"}},
         }
@@ -393,9 +394,9 @@ def write(db, nt: notion.Notion, cfg: dict, resolved: list[dict], now: dt.dateti
             db.execute("delete from rows where plan_id = ?", (plan_id,))
             db.commit()
             trashed += 1
-        elif status.get(tid) == "finished" and not row["done"]:
-            nt.update(row["page_id"], {"Done": {"checkbox": True}})
-            db.execute("update rows set done = 1 where plan_id = ?", (plan_id,))
+        elif status.get(tid) == "finished" and row["hash"] != "finished":
+            nt.update(row["page_id"], {"Done": {"checkbox": True}, "Due Date": {"date": None}})
+            db.execute("update rows set done = 1, hash = 'finished' where plan_id = ?", (plan_id,))
             db.commit()
             updated += 1
 
