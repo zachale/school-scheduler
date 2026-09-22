@@ -21,6 +21,7 @@ cfg = yaml.safe_load((HERE / "config.yaml").read_text())
 tasks = {t["id"]: t for t in json.loads((HERE / "resolved_tasks.json").read_text())}
 sched = json.loads((HERE / "schedule.json").read_text())
 progress = yaml.safe_load((HERE / "progress.yaml").read_text())
+busy = json.loads((HERE / "busy.json").read_text())["busy"]
 START = max(cfg["term"]["start"], progress["through"] + dt.timedelta(days=1))
 hm = lambda s: int(s[:2]) * 60 + int(s[3:])
 dtm = lambda s: dt.datetime.strptime(s, "%Y-%m-%d %H:%M")
@@ -81,6 +82,22 @@ for day in sched:
         if end > dtm(t["orig_due"]) and not t["overdue"]:
             fails.append(f"{date} AFTER REAL DEADLINE: {wb['title']} (due {t['orig_due']})")
         done[wb["task"]] += we - ws
+    # busy time on Zach's calendars: no work on it, except over a skipped lab's slot,
+    # which the planner deliberately treats as free
+    labs = [(hm(c["start"]), hm(c["end"])) for c in cfg["classes"]
+            if c.get("skip") and date.weekday() in c["days"]]
+    for b in busy:
+        if b["date"] != day["date"]:
+            continue
+        parts = [(hm(b["start"]), hm(b["end"]))]
+        for ls, le in labs:
+            parts = [(s, e) for ps, pe in parts
+                     for s, e in ((ps, min(pe, ls)), (max(ps, le), pe)) if e > s]
+        for ws, we, wb in work:
+            if any(ws < be and bs < we for bs, be in parts):
+                fails.append(f"{date} work on busy calendar time: {wb['title']} "
+                             f"{wb['start']}-{wb['end']} vs busy {b['start']}-{b['end']}")
+        n["busy"] += 1
     for i in range(len(work)):
         for j in range(i + 1, len(work)):
             if work[i][0] < work[j][1] and work[j][0] < work[i][1]:
@@ -167,7 +184,7 @@ for d in blocked:
     if any(o["date"] == d for o in cfg.get("no_class_days") or []):
         continue
     for c in cfg["classes"]:
-        if wd in c["days"] and d <= cfg["term"]["last_class_day"]:
+        if not c.get("skip") and wd in c["days"] and d <= cfg["term"]["last_class_day"]:
             missed.add(c["course"])
 have_cu = {t["course"] for t in tasks.values() if t["kind"] == "catchup"}
 
@@ -179,6 +196,8 @@ check(not any("REAL DEADLINE" in f for f in fails), "nothing lands after a real 
 check(not any("before earliest" in f or "effective due" in f for f in fails),
       "all work inside each task's resolved window")
 check(not any("overlap" in f for f in fails), "no overlaps with classes, exams, travel or meals")
+check(not any("busy calendar time" in f for f in fails),
+      f"no work on busy time from Google Calendar ({n['busy']} busy blocks checked)")
 check(not any("outside hours" in f for f in fails), "all work inside stated hours")
 check(not any("write-off" in f for f in fails),
       f"{n['blocked']} write-off days carry no work and no classes")

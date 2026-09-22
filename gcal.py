@@ -1,21 +1,23 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["google-api-python-client", "google-auth"]
+# dependencies = ["google-api-python-client", "google-auth", "pyyaml"]
 # ///
-"""Mirror the term plan into a dedicated Google Calendar, "F26 Plan".
+"""The planner's two links to Google Calendar, both through the f26-plan-sync robot.
 
-The calendar belongs to a service account in the your-gcp-project GCP project and is
-shared read-only with Zach, so this script can never see or change any of Zach's
-own calendars. It authenticates by impersonating that service account with the
-gcloud login already on this machine: no key file or client secret exists.
+    uv run gcal.py busy             # snapshot busy time on Zach's calendars -> busy.json
+    uv run gcal.py sync --dry-run   # report what pushing the plan would change
+    uv run gcal.py sync             # push the plan into the "F26 Plan" calendar
 
-    uv run sync_gcal.py --dry-run   # read the calendar, report what would change
-    uv run sync_gcal.py             # push the current plan
+The robot is a service account in the your-gcp-project GCP project. Zach's own calendars
+are shared with it as free/busy only, so `busy` sees when he is busy but never what
+the event is. "F26 Plan" belongs to the robot and is shared read-only with Zach. The
+script authenticates by impersonating the robot with the gcloud login already on this
+machine: no key file or client secret exists.
 
-Reads schedule.json and resolved_tasks.json, so run plan.py (and verify.py) first.
-Every event carries a stable key and a content hash in its private extended
-properties; a re-run adds, updates and deletes only what changed. Events before
-the plan's first day are left alone as history.
+`sync` reads schedule.json and resolved_tasks.json, so run plan.py and verify.py
+first. Every event carries a stable key and a content hash in its private extended
+properties; a re-run adds, updates and deletes only what changed. Events before the
+plan's first day are left alone as history.
 """
 from __future__ import annotations
 
@@ -29,6 +31,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import google.oauth2.credentials
+import yaml
 from google.auth import impersonated_credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -95,6 +98,35 @@ def desired_events(schedule: list[dict], tasks: list[dict]) -> dict[str, dict]:
     return out
 
 
+def fetch_busy(svc, calendars: list[str], start: dt.date, end: dt.date) -> list[dict]:
+    """Busy intervals on the given calendars, split at midnight into local days."""
+    tz = ZoneInfo(TZ)
+    seen: set[tuple[str, str, str]] = set()
+    d = start
+    while d < end:                                   # freebusy caps the range; go by month
+        stop = min(end, d + dt.timedelta(days=30))
+        res = svc.freebusy().query(body={
+            "timeMin": dt.datetime.combine(d, dt.time(), tz).isoformat(),
+            "timeMax": dt.datetime.combine(stop, dt.time(), tz).isoformat(),
+            "timeZone": TZ, "items": [{"id": c} for c in calendars],
+        }).execute(num_retries=RETRIES)
+        for cid, cal in res["calendars"].items():
+            if cal.get("errors"):
+                raise SystemExit(f"cannot read free/busy for {cid}: {cal['errors']}. "
+                                 f"Is it shared with {SERVICE_ACCOUNT}?")
+            for b in cal.get("busy", []):
+                s = dt.datetime.fromisoformat(b["start"]).astimezone(tz)
+                e = dt.datetime.fromisoformat(b["end"]).astimezone(tz)
+                while s < e:
+                    midnight = dt.datetime.combine(s.date() + dt.timedelta(days=1), dt.time(), tz)
+                    cut = min(e, midnight)
+                    seen.add((str(s.date()), f"{s:%H:%M}",
+                              "24:00" if cut == midnight else f"{cut:%H:%M}"))
+                    s = cut
+        d = stop
+    return [{"date": a, "start": b, "end": c} for a, b, c in sorted(seen)]
+
+
 def ensure_calendar(svc, dry: bool) -> str | None:
     cid = json.loads(STATE.read_text())["calendar_id"] if STATE.exists() else None
     if cid:
@@ -135,17 +167,23 @@ def existing_events(svc, cid: str, start: str) -> dict[str, list[dict]]:
             return out
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--dry-run", action="store_true", help="report changes without writing")
-    args = ap.parse_args()
+def busy() -> None:
+    cfg = yaml.safe_load((HERE / "config.yaml").read_text())
+    progress = yaml.safe_load((HERE / "progress.yaml").read_text())
+    calendars = cfg["google_calendar"]["read_busy_from"]
+    start = max(cfg["term"]["start"], progress["through"] + dt.timedelta(days=1))
+    out = fetch_busy(service(), calendars, start, cfg["term"]["plan_until"] + dt.timedelta(days=1))
+    (HERE / "busy.json").write_text(json.dumps({"calendars": calendars, "busy": out}, indent=1) + "\n")
+    print(f"{len(out)} busy blocks on {', '.join(calendars)} from {start:%a %b %d} -> busy.json")
 
+
+def sync(dry_run: bool) -> None:
     schedule = json.loads((HERE / "schedule.json").read_text())
     tasks = json.loads((HERE / "resolved_tasks.json").read_text())
     want = desired_events(schedule, tasks)
 
     svc = service()
-    cid = ensure_calendar(svc, args.dry_run)
+    cid = ensure_calendar(svc, dry_run)
     have = existing_events(svc, cid, schedule[0]["date"]) if cid else {}
 
     add = [k for k in want if k not in have]
@@ -159,7 +197,7 @@ def main() -> None:
           f"{sum(1 for k in want if k.startswith('due|'))} deadlines)")
     print(f"  add {len(add)} · update {len(update)} · delete {len(delete)} · "
           f"unchanged {len(want) - len(add) - len(update)}")
-    if args.dry_run:
+    if dry_run:
         if not cid:
             print("  (calendar does not exist yet; a real run creates it)")
         return
@@ -172,6 +210,19 @@ def main() -> None:
     for ev in delete:
         events.delete(calendarId=cid, eventId=ev["id"]).execute(num_retries=RETRIES)
     print("  synced")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("busy", help="snapshot busy time on Zach's calendars into busy.json")
+    sp = sub.add_parser("sync", help="push the plan into the F26 Plan calendar")
+    sp.add_argument("--dry-run", action="store_true", help="report changes without writing")
+    args = ap.parse_args()
+    if args.cmd == "busy":
+        busy()
+    else:
+        sync(args.dry_run)
 
 
 if __name__ == "__main__":

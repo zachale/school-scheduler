@@ -5,9 +5,10 @@ ad-hoc commitments. Deterministic: same inputs always give the same plan, so add
 constraint and re-running reflows everything predictably.
 
 ```bash
+uv run gcal.py busy             # snapshot busy time on Zach's Google Calendar
 uv run plan.py                  # replan + render
 uv run verify.py                # check the result against every stated constraint
-uv run sync_gcal.py             # mirror it into the "F26 Plan" Google Calendar
+uv run gcal.py sync             # mirror it into the "F26 Plan" Google Calendar
 ```
 
 ## Files
@@ -22,8 +23,9 @@ uv run sync_gcal.py             # mirror it into the "F26 Plan" Google Calendar
 | `verify.py` | Independent constraint checker; exits non-zero on violation |
 | `calendar.html` | Week-grid view, Google-Calendar style |
 | `schedule.json` | Machine-readable output |
-| `sync_gcal.py` | Pushes the plan into the "F26 Plan" Google Calendar |
-| `gcal.json` | That calendar's id, written by the first sync |
+| `gcal.py` | Google Calendar link: `busy` reads Zach's busy time, `sync` pushes the plan |
+| `busy.json` | Snapshot of busy time on Zach's calendars (times only, no titles) |
+| `gcal.json` | The "F26 Plan" calendar's id, written by the first sync |
 | `_gen_tasks.py` | One-off that built `tasks.yaml`; kept for provenance |
 
 ## Changing the plan in plain English
@@ -33,7 +35,7 @@ calendar. The translations are mechanical:
 
 | You say | What changes |
 |---|---|
-| "I have a thing Thursday 6–9pm" | a row in `events.yaml` |
+| "I have a thing Thursday 6–9pm" | nothing, if it is a Busy event on your calendar; otherwise a row in `events.yaml` |
 | "I didn't do anything today" | `through:` in `progress.yaml` moves to today |
 | "I got 2 h of the MATH 3240 assignment done" | `math3240-a1: 120` under `done:`, and `through:` |
 | "no weekends" | `work_hours.include_weekends: false` |
@@ -113,7 +115,7 @@ ENVS*2210 penalises clustering posts into the final 24 hours.
 
 ## Google Calendar sync
 
-`sync_gcal.py` mirrors the plan into a dedicated **"F26 Plan"** calendar: every work block,
+`gcal.py sync` mirrors the plan into a dedicated **"F26 Plan"** calendar: every work block,
 plus an all-day ⚑ event on each hand-in's real deadline. Each event carries a stable key and a
 content hash, so a re-run only adds, updates or deletes what changed. Days before the plan
 start are left alone as history. `--dry-run` reports the changes without writing.
@@ -130,20 +132,21 @@ How it connects (set up 2026-09-21):
   2026-09-21):
   `gcloud iam service-accounts add-iam-policy-binding planner-bot@your-project.iam.gserviceaccount.com --project your-gcp-project --member user:you@example.com --role roles/iam.serviceAccountTokenCreator`
 
-Reading Zach's own calendar (options, 2026-09-21, not built yet). The planner cannot see it
-today, which is how a Sep 26 wedding ended up under study blocks. Ranked:
+Reading Zach's own calendar (built 2026-09-21). Zach shared his main calendar with the robot
+as **free/busy only**. `gcal.py busy` snapshots its busy time into `busy.json`, and `plan.py`
+blocks each busy stretch with a 30-minute buffer either side, after removing time it already
+schedules itself: classes, the skipped Friday labs (now listed in `config.yaml` with
+`skip: true`), exams and `events.yaml` rows. `verify.py` fails any work on busy time.
 
-1. Share the "Zach Legesse" calendar with the service account as **free/busy only**. Each
-   replan queries busy times and blocks them like `events.yaml` rows. The robot never sees
-   titles, so busy slots matching a class or lab the planner already models are skipped
-   (labs need their times back in `config.yaml`), and off-campus travel is unknown, so a
-   default buffer applies.
-2. Share it with **all event details**. Titles allow filtering classes and labs by course code
-   and locations hint at travel, at the cost of the robot reading everything.
-3. Keep telling Claude in chat (`events.yaml`). No setup, but it only works when remembered.
+Free/busy has two blind spots, both found on Sep 26: events on other calendars (the wedding
+is on "Family") and events marked **Free** (the reception was auto-created from Gmail, which
+defaults to Free). Fixes: share those calendars too and add their ids to
+`google_calendar.read_busy_from`, mark such events Busy, or add them to `events.yaml`.
+Upgrading the share to full event details would also expose Free events, at the cost of the
+robot reading titles.
 
-Only events marked Busy block time, so all-day items like birthdays are ignored either way.
-Calendar changes are picked up at the next replan, not on their own.
+Options considered: free/busy (chosen: least access), full details (catches Free events, reads
+everything), chat only (works only when remembered).
 
 Why a synced calendar rather than a subscribed ICS feed: Google Calendar refreshes URL
 subscriptions every 12-24 h with no manual refresh, so a same-day reflow would show the old plan
@@ -160,21 +163,20 @@ Sources: [Calendars: insert](https://developers.google.com/workspace/calendar/ap
 
 ## Current state
 
-Calendar sync is live (2026-09-21): "F26 Plan" holds 244 events (221 work blocks, 23
-deadlines) and appears under Other calendars in you@example.com's Google Calendar. A
-re-sync with no plan change reports 0 changes. Events show in the calendar's own colour;
-Google only shows per-event colours to the calendar owner.
-
 Progress logged through Mon Sep 21 with nothing done, so the plan runs from Tue Sep 22:
 394.8 h across 76 working days with Oct 5–10 written off and **hand-ins finishing 3 days
-early** (adopted 2026-09-21). Every one of the 23 hand-ins lands at least 3 days before its
-real deadline; the median is 4 days. Cost: 14.6 h of evening work across the term, busiest
-day 8.2 h (Thu Nov 19). `verify.py` checks the buffer directly and passes every check.
+early**. Every hand-in lands at least 3 days before its real deadline. Cost: 19.1 h of
+evening work across the term, busiest day 8.2 h. `verify.py` passes every check.
 
-Losing Monday (2.8 h) cost 4 h of evenings, all on Thu Oct 22 (CIS*3210 midterm prep between
-the Oct 21 midterms and the Oct 24 one). The late-September class days are already full in core
-hours, and the scheduler only opens evenings for work that is pressed, so the slip surfaces in
-the post-trip crunch rather than this week. ENVS Reading wk1 is one day overdue and runs Tue.
+Sat Sep 26 is blocked 11:10 onward for a wedding and reception (in `events.yaml`, since
+free/busy cannot see either). Losing that afternoon moved 4.5 h into evenings on Oct 16 and
+Oct 20, the run-up to the Oct 21 midterms. Losing Monday Sep 21 earlier cost 4 h of evenings
+on Oct 22. The scheduler only opens evenings for work that is pressed, so lost time surfaces
+in the pre-midterm crunch.
+
+Calendar sync is live: "F26 Plan" holds 242 events (219 work blocks, 23 deadlines) under Other
+calendars in you@example.com's Google Calendar. Events take the calendar's own colour;
+Google only shows per-event colours to the calendar owner.
 
 On the calendar, ⚑ flags sit on each hand-in's **real** deadline, so the gap between the
 last work block and the flag is the buffer.

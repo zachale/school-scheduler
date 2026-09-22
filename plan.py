@@ -6,6 +6,7 @@
 
 Reads  config.yaml (constraints) · tasks.yaml (work) · events.yaml (ad-hoc commitments)
        progress.yaml (what is done, and the last day accounted for)
+       busy.json (busy time on Zach's own calendars, from `uv run gcal.py busy`)
 Writes schedule.json (machine-readable) · calendar.html (week grids)
 
     uv run plan.py                 # replan and render
@@ -81,6 +82,12 @@ def class_weekday(cfg: dict, date: dt.date) -> int | None:
     return date.weekday()
 
 
+def attended(cfg: dict) -> list[dict]:
+    """Classes actually gone to; skipped labs are listed in config only so their
+    calendar slots are recognised."""
+    return [c for c in cfg["classes"] if not c.get("skip")]
+
+
 def missed_lectures(cfg: dict, blocked: dict) -> dict[str, list[dt.date]]:
     """Lectures that would have run on a blocked day, by course."""
     out: dict[str, list[dt.date]] = {}
@@ -88,7 +95,7 @@ def missed_lectures(cfg: dict, blocked: dict) -> dict[str, list[dt.date]]:
         wd = class_weekday(cfg, d)
         if wd is None:
             continue
-        for c in cfg["classes"]:
+        for c in attended(cfg):
             if wd in c["days"]:
                 out.setdefault(c["course"], []).append(d)
     return out
@@ -96,7 +103,8 @@ def missed_lectures(cfg: dict, blocked: dict) -> dict[str, list[dt.date]]:
 
 # ---------- the day model ----------------------------------------------------
 class Day:
-    def __init__(self, date: dt.date, cfg: dict, events: list[dict], blocked: dict):
+    def __init__(self, date: dt.date, cfg: dict, events: list[dict], blocked: dict,
+                 busy: list[dict]):
         self.date = date
         self.cfg = cfg
         self.fixed: list[dict] = []          # classes, travel, meals, ad-hoc
@@ -106,20 +114,20 @@ class Day:
             self.fixed.append({"start": hm("07:00"), "end": hm("22:00"),
                                "title": self.blocked, "cat": "Personal"})
         else:
-            self._build(events)
+            self._build(events, [b for b in busy if b["date"] == str(date)])
 
     # -- fixed commitments
     def _class_weekday(self) -> int | None:
         return class_weekday(self.cfg, self.date)
 
-    def _build(self, events: list[dict]) -> None:
+    def _build(self, events: list[dict], busy: list[dict]) -> None:
         trav = self.cfg["travel"]["minutes_each_way"]
 
         # classes for this day, merged into on-campus trips
         wd = self._class_weekday()
         classes = []
         if wd is not None:
-            for c in self.cfg["classes"]:
+            for c in attended(self.cfg):
                 if wd in c["days"]:
                     classes.append((hm(c["start"]), hm(c["end"]), c))
         classes.sort()
@@ -168,6 +176,27 @@ class Day:
                 self.fixed.append({"start": s - trav, "end": s, "title": "Travel", "cat": "Travel"})
                 self.fixed.append({"start": e, "end": e + trav, "title": "Travel", "cat": "Travel"})
             self.fixed.append({"start": s, "end": e, "title": ev["title"], "cat": "Personal"})
+
+        # busy time on Zach's own calendars, minus anything already accounted for above
+        # (his calendar carries the same classes, labs and exams)
+        known = [(b["start"], b["end"]) for b in self.fixed]
+        known += [(hm(c["start"]), hm(c["end"])) for c in self.cfg["classes"]
+                  if wd is not None and wd in c["days"]]
+        buf = self.cfg["google_calendar"]["buffer_minutes"]
+        added: list[tuple[int, int]] = []
+        for b in busy:
+            parts = [(hm(b["start"]), hm(b["end"]))]
+            for k in known:
+                parts = subtract(parts, k)
+            added += [(s, e) for s, e in parts if e - s >= 15]
+        for s, e in added:
+            self.fixed.append({"start": s, "end": e, "title": "Busy (Google Calendar)",
+                               "cat": "Personal"})
+            pad = [(max(0, s - buf), s), (e, min(24 * 60, e + buf))]
+            for k in known + added:
+                pad = subtract(pad, k)
+            for ps, pe in pad:
+                self.fixed.append({"start": ps, "end": pe, "title": "Buffer", "cat": "Travel"})
 
         # meals, slid to avoid whatever is already fixed
         for meal in self.cfg["meals"]:
@@ -344,12 +373,13 @@ def prepare(cfg: dict, tasks: list[dict], blocked: dict, start_from: dt.date):
 
 
 # ---------- scheduler --------------------------------------------------------
-def schedule(cfg: dict, tasks: list[dict], events: list[dict], start_from: dt.date):
+def schedule(cfg: dict, tasks: list[dict], events: list[dict], busy: list[dict],
+             start_from: dt.date):
     term = cfg["term"]
     d0, d1 = max(term["start"], start_from), term["plan_until"]
     blocked = blocked_dates(cfg)
     tasks, changes = prepare(cfg, tasks, blocked, d0)
-    days = [Day(d0 + dt.timedelta(days=i), cfg, events, blocked)
+    days = [Day(d0 + dt.timedelta(days=i), cfg, events, blocked, busy)
             for i in range((d1 - d0).days + 1)]
 
     S = cfg["sessions"]
@@ -533,8 +563,11 @@ def render(days, unplaced, cfg, tasks) -> str:
     PX = 42 / 60  # one hour = 42px
 
     def block_html(b, fixed):
-        top = (b["start"] - T0) * PX
-        h = max((b["end"] - b["start"]) * PX, 12)
+        s, e = max(b["start"], T0), min(b["end"], T1)
+        if e <= s:
+            return ""
+        top = (s - T0) * PX
+        h = max((e - s) * PX, 12)
         col = colours.get(b.get("cat"), "#5f6368")
         cls = "ev fixed" if fixed else "ev"
         if b.get("overflow"):
@@ -654,9 +687,10 @@ def main() -> None:
     tasks = yaml.safe_load((HERE / "tasks.yaml").read_text())["tasks"]
     events = (yaml.safe_load((HERE / "events.yaml").read_text()) or {}).get("events") or []
     progress = yaml.safe_load((HERE / "progress.yaml").read_text())
+    busy = json.loads((HERE / "busy.json").read_text())["busy"]
 
     tasks, start_from = apply_progress(cfg, tasks, progress)
-    days, unplaced, tasks, changes = schedule(cfg, tasks, events, start_from)
+    days, unplaced, tasks, changes = schedule(cfg, tasks, events, busy, start_from)
 
     (HERE / "calendar.html").write_text(render(days, unplaced, cfg, tasks))
     (HERE / "resolved_tasks.json").write_text(json.dumps([{
