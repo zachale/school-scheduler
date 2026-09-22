@@ -310,27 +310,54 @@ def add_catchups(cfg: dict, tasks: list[dict], blocked: dict) -> list[str]:
     return changes
 
 
+WRAPUP_MINUTES = 30
+
+
 def apply_state(tasks: list[dict], state: dict):
-    """Take finished and started minutes off each task and drop what needs no more
-    time. Returns the tasks still owed time and the finished ones (with _finished_on)."""
+    """Apply learned speed, take finished and started minutes off each task, and set
+    aside what needs no more time. Returns the tasks still owed time and the closed ones
+    (each with _status finished | dropped | awaiting, and _finished_on).
+
+    A hand-in ("work") is finished when Zach checks it off, not when its minutes run
+    out: past its estimate it gets one short wrap-up session, then waits ("awaiting")."""
     done, last = state.get("done") or {}, state.get("last_done") or {}
-    closed = set(state.get("finished") or []) | set(state.get("dropped") or [])
+    finished_ids = set(state.get("finished") or [])
+    dropped_ids = set(state.get("dropped") or [])
+    awaiting_ids = set(state.get("awaiting") or [])
+    speed = state.get("multiplier") or {}
     today = dt.datetime.fromisoformat(state["now"]).date()
     pinned: dict[str, int] = {}
     for b in state.get("pinned") or []:
         pinned[b["task"]] = pinned.get(b["task"], 0) + hm(b["end"]) - hm(b["start"])
-    owed, finished = [], []
+    owed, closed = [], []
     for t in tasks:
-        t["_done"] = min(int(done.get(t["id"], 0)), t["minutes"])
+        t["_base"] = t["minutes"]
+        if t["id"] in speed:
+            t["minutes"] = max(5, round(t["minutes"] * speed[t["id"]]))
+        t["_done"] = int(done.get(t["id"], 0))
         t["_pinned"] = pinned.get(t["id"], 0)
-        if t["id"] in closed or t["minutes"] - t["_done"] - t["_pinned"] <= 0:
+        left = t["minutes"] - t["_done"] - t["_pinned"]
+        status = None
+        if t["id"] in dropped_ids:
+            status = "dropped"
+        elif t["id"] in finished_ids:
+            status = "finished"
+        elif left <= 0:
+            if t["kind"] != "work":
+                status = "finished"            # its minutes are the whole job
+            elif t["id"] in awaiting_ids:
+                status = "awaiting"            # wrapped up; waiting to be handed in
+            else:
+                t["minutes"] = t["_done"] + t["_pinned"] + WRAPUP_MINUTES
+                t["_wrapup"] = True
+        if status:
+            t["_status"] = status
             t["_finished_on"] = (today if t["_pinned"]
                                  else dt.date.fromisoformat(last.get(t["id"], str(today))))
-            t["_status"] = "dropped" if t["id"] in (state.get("dropped") or []) else "finished"
-            finished.append(t)
-            continue
-        owed.append(t)
-    return owed, finished
+            closed.append(t)
+        else:
+            owed.append(t)
+    return owed, closed
 
 
 def resolve_windows(cfg: dict, tasks: list[dict], blocked: dict, now: dt.datetime,
@@ -582,6 +609,7 @@ def schedule(cfg: dict, tasks: list[dict], events: list[dict], busy: list[dict],
                                 "cat": t["course"], "course": t["course"], "task": t["id"],
                                 "kind": t["kind"], "overflow": overflow,
                                 "due": t["due"], "note": t.get("note", ""),
+                                **({"wrapup": True} if t.get("_wrapup") else {}),
                             })
                             t["remaining"] -= chunk
                             if t.get("spread_group") and t["remaining"] == 0:
@@ -818,7 +846,8 @@ def main() -> None:
     (HERE / "calendar.html").write_text(render(days, unplaced, cfg, tasks, overdue, now))
     row = lambda t, status: {
         "id": t["id"], "course": t["course"], "title": t["title"], "kind": t["kind"],
-        "minutes": t["minutes"], "done": t["_done"], "owed": t["minutes"] - t["_done"],
+        "minutes": t["minutes"], "base_minutes": t.get("_base", t["minutes"]),
+        "done": t["_done"], "owed": t["minutes"] - t["_done"],
         "status": status, "late": bool(t.get("_overdue")), "earliest": str(t["_earliest"]),
         "due": f"{t['_due']:%Y-%m-%d %H:%M}", "orig_due": f"{t['_orig_due']:%Y-%m-%d %H:%M}",
         "spread_group": t.get("spread_group"), "note": t.get("note", ""),

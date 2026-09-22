@@ -5,6 +5,7 @@
 set -eu
 cd "$(dirname "$0")/.."
 rsync -a config.yaml tasks.yaml events.yaml gcal.json plan.py verify.py gcal.py service.py \
+    notion.py notion_sync.py notion_map.py learn.py \
     deploy/f26-planner.service vm:f26-planner/
 ssh vm 'mkdir -p ~/.config/systemd/user \
     && cp ~/f26-planner/f26-planner.service ~/.config/systemd/user/ \

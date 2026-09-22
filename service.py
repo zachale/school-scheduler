@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["google-api-python-client", "google-auth", "pyyaml"]
+# dependencies = ["google-api-python-client", "google-auth", "pyyaml", "requests"]
 # ///
 """The F26 autoplanner: keeps the plan and the "F26 Plan" calendar current, no LLM.
 
@@ -15,9 +15,13 @@ Runs on the VM under systemd (deploy/f26-planner.service). Every cycle it:
     uv run service.py --once             # one cycle, then exit
     uv run service.py --once --dry-run   # plan and diff, write nothing
 
-Until Notion tracking arrives (PRD milestone M3), a session that has passed is assumed
-done. Inputs are deployed next to this file; state and outputs live in
-~/.local/state/f26-planner (SQLite plus a work directory the planner runs in).
+Once the Notion token is on the VM, Could Do is the only "done" signal: a block checked
+off is done (and trimmed to the moment it was checked), a block still unchecked when its
+day ends is missed and its minutes are planned again, and finished tasks teach the
+planner Zach's real pace (learn.py). Without the token, a passed block is assumed done.
+
+Inputs are deployed next to this file; state and outputs live in ~/.local/state/f26-planner
+(SQLite plus a work directory the planner runs in).
 """
 from __future__ import annotations
 
@@ -37,13 +41,17 @@ from zoneinfo import ZoneInfo
 import yaml
 
 import gcal
+import learn
+import notion
+import notion_sync
 
 APP = Path(__file__).resolve().parent
 STATE = Path("~/.local/state/f26-planner").expanduser()
 WORK = STATE / "work"
 INPUTS = ["config.yaml", "tasks.yaml", "events.yaml", "plan.py", "verify.py"]
-# everything that can change what ends up on the calendar
-WATCHED = INPUTS + ["service.py", "gcal.py", "gcal.json"]
+# everything that can change what ends up on the calendar or in Notion
+WATCHED = INPUTS + ["service.py", "gcal.py", "gcal.json", "notion.py", "notion_sync.py",
+                    "notion_map.py", "learn.py"]
 TZ = ZoneInfo("America/Toronto")
 CYCLE_SECONDS = 60
 ALERT_AFTER = 5            # consecutive failed cycles before an alert event
@@ -70,15 +78,23 @@ def open_db() -> sqlite3.Connection:
     db.row_factory = sqlite3.Row
     db.executescript("""
         create table if not exists sessions (
-            id     text primary key,     -- "<task>#<seq>", never reused
-            task   text not null,
-            seq    integer not null,
-            date   text not null,
-            start  text not null,
-            "end"  text not null,
-            status text not null,        -- planned | done | cancelled
-            block  text not null         -- the schedule.json work block, as JSON
+            id          text primary key,  -- "<task>#<seq>", never reused
+            task        text not null,
+            seq         integer not null,
+            date        text not null,
+            start       text not null,
+            "end"       text not null,     -- trimmed to the check time when done early
+            planned_min integer not null,  -- the block as planned; what "done" counts
+            status      text not null,     -- planned | done | missed | cancelled
+            actual_min  integer,           -- measured, or planned when not measurable
+            measured    integer not null default 0,
+            block       text not null      -- the schedule.json work block, as JSON
         );
+        create table if not exists rows (      -- Could Do rows carrying a Plan ID
+            plan_id text primary key, page_id text not null, hash text not null,
+            done integer not null default 0, state text);
+        create table if not exists finished (task text primary key, day text not null);
+        create table if not exists dropped (task text primary key, day text not null);
         create table if not exists kv (k text primary key, v text);
     """)
     return db
@@ -99,34 +115,57 @@ def minutes(row) -> int:
     return h(row["end"]) - h(row["start"])
 
 
+def notion_on() -> bool:
+    return notion.TOKEN_FILE.expanduser().exists()
+
+
 def rollover(db, now: dt.datetime, commit: bool = True) -> bool:
-    """Once the day turns, the sessions left on earlier days become history. Returns
-    True if it ran. Sessions already marked missed are left alone: they are the way to
-    say "that block did not happen", and their minutes go back into the plan."""
+    """Once the day turns, the blocks left unchecked on earlier days become history:
+    missed, with their minutes planned again. Without Notion there is no done signal,
+    so they are assumed done instead. Returns True if it ran."""
     today = str(now.date())
     if kv(db, "rolled_over") == today:
         return False
-    # no done signal yet (Notion arrives in M3): a passed session is assumed done
-    n = db.execute("update sessions set status = 'done' where status = 'planned' and date < ?",
-                   (today,)).rowcount
+    if notion_on():
+        n = db.execute("update sessions set status = 'missed' where status = 'planned' "
+                       "and date < ?", (today,)).rowcount
+        what = "missed (unchecked)"
+    else:
+        n = db.execute("update sessions set status = 'done', actual_min = planned_min "
+                       "where status = 'planned' and date < ?", (today,)).rowcount
+        what = "assumed done"
     set_kv(db, "rolled_over", today)
     if commit:
         db.commit()
-        log(f"rollover {today}: {n} sessions from earlier days recorded as done")
+        log(f"rollover {today}: {n} blocks from earlier days {what}")
     return True
 
 
 def planner_state(db, now: dt.datetime) -> dict:
+    """Everything the planner needs besides its input files. "done" counts a finished
+    block at its planned length: a block ticked off early is still that block's work."""
     today, hhmm = str(now.date()), f"{now:%H:%M}"
-    done, last = {}, {}
+    done, last, awaiting = {}, {}, set()
     for r in db.execute("select * from sessions where status = 'done'"):
-        done[r["task"]] = done.get(r["task"], 0) + minutes(r)
+        done[r["task"]] = done.get(r["task"], 0) + r["planned_min"]
         last[r["task"]] = max(last.get(r["task"], r["date"]), r["date"])
+    for r in db.execute("select * from sessions where status in ('done', 'missed')"):
+        if json.loads(r["block"]).get("wrapup"):
+            awaiting.add(r["task"])           # wrapped up; now it waits to be handed in
     pinned = [{**json.loads(r["block"]), "session": r["id"]}
               for r in db.execute("select * from sessions where status = 'planned' "
                                   "and date = ? and start < ? order by start", (today, hhmm))]
-    return {"now": f"{now:%Y-%m-%dT%H:%M}", "done": done, "last_done": last,
-            "pinned": pinned, "finished": [], "dropped": [], "late_ok": []}
+    state = {"now": f"{now:%Y-%m-%dT%H:%M}", "done": done, "last_done": last,
+             "pinned": pinned, "awaiting": sorted(awaiting), **notion_sync.state(db)}
+    # learned pace, from the tasks the last good plan called finished
+    base = {t["id"]: t["minutes"] for t in yaml.safe_load((APP / "tasks.yaml").read_text())["tasks"]}
+    resolved = kv(db, "resolved", [])
+    started = set(done) | {b["task"] for b in pinned}
+    mult = learn.multipliers(learn.evidence(db, resolved, base))
+    tasks = [t for t in resolved if t["id"] in base]
+    state["multiplier"] = learn.per_task(tasks, mult, started)
+    set_kv(db, "learned", mult)
+    return state
 
 
 # ---------- planning ---------------------------------------------------------
@@ -136,7 +175,8 @@ def fingerprint(busy: list[dict], state: dict) -> str:
         h.update((APP / name).read_bytes())
     h.update(json.dumps(busy, sort_keys=True).encode())
     # what the plan depends on besides the inputs: the day, and which sessions are history
-    h.update(json.dumps({k: state[k] for k in ("done", "finished", "dropped", "late_ok")},
+    h.update(json.dumps({k: state[k] for k in ("done", "finished", "dropped", "late_ok",
+                                               "awaiting", "multiplier")},
                         sort_keys=True).encode())
     h.update(state["now"][:10].encode())
     return h.hexdigest()
@@ -185,14 +225,17 @@ def match_sessions(db, schedule: list[dict], now: dt.datetime) -> None:
         new = sorted(blocks.get(task, []), key=lambda x: (x[0], x[1]["start"]))
         old = open_rows.get(task, [])
         for i, (date, b) in enumerate(new):
+            length = minutes(b)
             if i < len(old):
-                db.execute('update sessions set date = ?, start = ?, "end" = ?, block = ? '
-                           "where id = ?", (date, b["start"], b["end"], json.dumps(b), old[i]["id"]))
+                db.execute('update sessions set date = ?, start = ?, "end" = ?, planned_min = ?, '
+                           "block = ? where id = ?",
+                           (date, b["start"], b["end"], length, json.dumps(b), old[i]["id"]))
             else:
                 top[task] = top.get(task, 0) + 1
-                db.execute("insert into sessions values (?, ?, ?, ?, ?, ?, 'planned', ?)",
+                db.execute('insert into sessions (id, task, seq, date, start, "end", planned_min, '
+                           "status, block) values (?, ?, ?, ?, ?, ?, ?, 'planned', ?)",
                            (f"{task}#{top[task]}", task, top[task], date, b["start"], b["end"],
-                            json.dumps(b)))
+                            length, json.dumps(b)))
         for r in old[len(new):]:
             db.execute("update sessions set status = 'cancelled' where id = ?", (r["id"],))
 
@@ -228,6 +271,11 @@ def desired_events(db, resolved: list[dict], today: dt.date) -> dict:
             want[f"due|{t['id']}"] = gcal.keyed(f"due|{t['id']}", {
                 "summary": f"⚑ Due {due:%H:%M}: {t['course']} {t['title']}",
                 "description": f"Real deadline. {note}", **all_day(due.date())})
+        if t["status"] == "awaiting" and due <= dt.datetime.combine(today, dt.time(23, 59)):
+            want[f"overdue|{t['id']}"] = gcal.keyed(f"overdue|{t['id']}", {
+                "summary": f"⚠ Not checked off: {t['course']} {t['title']}",
+                "description": f"Was due {t['orig_due']}. Its blocks are done; check it off in "
+                               "Could Do once it is handed in.", **all_day(today)})
         if t["status"] == "overdue":
             want[f"overdue|{t['id']}"] = gcal.keyed(f"overdue|{t['id']}", {
                 "summary": f"⚠ Overdue, no longer scheduled: {t['course']} {t['title']}",
@@ -259,6 +307,17 @@ def clear_alert(db, svc) -> None:
     log("alert cleared")
 
 
+def write_stats(db, nt, cfg, resolved: list[dict], state: dict) -> None:
+    base = {t["id"]: t["minutes"] for t in yaml.safe_load((APP / "tasks.yaml").read_text())["tasks"]}
+    ev = learn.evidence(db, resolved, base)
+    started = set(state["done"]) | {b["task"] for b in state["pinned"]}
+    tasks = [t for t in resolved if t["id"] in base]
+    lines = learn.report(ev, kv(db, "learned", {}), tasks, started)
+    if lines != kv(db, "stats_lines"):
+        nt.set_page_text(cfg["notion"]["stats_page"], lines)
+        set_kv(db, "stats_lines", lines)
+
+
 def calendar_id() -> str:
     return json.loads((APP / "gcal.json").read_text())["calendar_id"]
 
@@ -272,6 +331,9 @@ def cycle(db, svc, dry_run: bool) -> None:
     cfg = yaml.safe_load((APP / "config.yaml").read_text())
     busy = gcal.fetch_busy(svc, cfg["google_calendar"]["read_busy_from"], now.date(),
                            cfg["term"]["plan_until"] + dt.timedelta(days=1))
+    nt = notion.Notion(cfg["notion"]["data_source"]) if notion_on() else None
+    if nt:
+        notion_sync.read(db, nt, cfg, clock)
     state = planner_state(db, now)
     fp = fingerprint(busy, state)
     if fp == kv(db, "fingerprint") and not forced and not dry_run:
@@ -295,6 +357,10 @@ def cycle(db, svc, dry_run: bool) -> None:
     if dry_run:
         db.rollback()
         return
+    if nt:
+        added, updated, trashed = notion_sync.write(db, nt, cfg, resolved, now)
+        log(f"  notion rows: add {added} · update {updated} · trash {trashed}")
+        write_stats(db, nt, cfg, resolved, state)
     clear_alert(db, svc)
     set_kv(db, "fingerprint", fp)
     set_kv(db, "resolved", resolved)
