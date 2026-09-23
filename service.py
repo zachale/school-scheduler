@@ -72,12 +72,13 @@ def round_up(t: dt.datetime, step: int = 5) -> dt.datetime:
 
 
 # ---------- state ------------------------------------------------------------
-SCHEMA = 4         # bump when a table changes; add the in-place step to MIGRATIONS
+SCHEMA = 5         # bump when a table changes; add the in-place step to MIGRATIONS
 MIGRATIONS = {     # from version -> statements that bring it to the next one
     3: ["alter table sessions add column locked integer not null default 0",
         "alter table sessions add column user_min integer",
         "alter table rows add column w_start text",
         "alter table rows add column w_end text"],
+    4: ["alter table finished add column block text"],
 }
 
 
@@ -125,7 +126,9 @@ def open_db() -> sqlite3.Connection:
             done integer not null default 0, state text,
             w_start text, w_end text);     -- a block row's times as the service last wrote them
         create table if not exists finished (task text primary key, day text not null,
-                                             actual integer);  -- total minutes, if typed in
+                                             actual integer,   -- total minutes, if typed in
+                                             block text);      -- the block whose tick finished
+                                                               -- it; null when a row did
         create table if not exists dropped (task text primary key, day text not null);
         create table if not exists kv (k text primary key, v text);
     """)
@@ -233,7 +236,7 @@ def fingerprint(busy: list[dict], state: dict) -> str:
     # what the plan depends on besides the inputs: the day, and which sessions are history
     h.update(json.dumps({k: state[k] for k in ("done", "finished", "dropped", "late_ok",
                                                "wrapped", "multiplier", "last_done",
-                                               "locked", "sized")},
+                                               "locked", "sized", "hand_in")},
                         sort_keys=True).encode())
     h.update(state["now"][:10].encode())
     return h.hexdigest()
@@ -314,6 +317,7 @@ def desired_events(db, resolved: list[dict], today: dt.date) -> dict:
     """What "F26 Plan" should hold: only warnings. The blocks and deadlines are Could Do
     rows, which Notion Calendar shows and Zach edits."""
     want: dict[str, dict] = {}
+    covered = notion_sync.covered(db)
     all_day = lambda d: {"start": {"date": str(d)}, "end": {"date": str(d + dt.timedelta(days=1))},
                          "transparency": "transparent"}
     for t in resolved:
@@ -324,11 +328,13 @@ def desired_events(db, resolved: list[dict], today: dt.date) -> dict:
                 "description": f"Was due {t['orig_due']}. Its blocks are done; check it off in "
                                "Could Do once it is handed in.", **all_day(today)})
         if t["status"] == "overdue":
+            fix = ("Set its row's Plan state to Late OK in Could Do to keep working on it, or "
+                   "check the row off if it is done." if t["id"] in covered else
+                   "It has no row of its own in Could Do: ask Claude to keep it in the plan "
+                   "or drop it.")
             want[f"overdue|{t['id']}"] = gcal.keyed(f"overdue|{t['id']}", {
                 "summary": f"⚠ Overdue, no longer scheduled: {t['course']} {t['title']}",
-                "description": f"Was due {t['orig_due']}. Set its Plan state to Late OK in Could "
-                               "Do to keep working on it, or check it off if it is done.",
-                **all_day(today)})
+                "description": f"Was due {t['orig_due']}. {fix}", **all_day(today)})
     return want
 
 
@@ -375,13 +381,16 @@ def cycle(db, svc, dry_run: bool) -> None:
     clock = local_now()
     # never round past midnight: today's sessions must stay today's
     now = min(round_up(clock), clock.replace(hour=23, minute=59))
-    forced = rollover(db, now, commit=not dry_run)
     cfg = yaml.safe_load((APP / "config.yaml").read_text())
     busy = gcal.fetch_busy(svc, cfg["google_calendar"]["read_busy_from"], now.date(),
                            cfg["term"]["plan_until"] + dt.timedelta(days=1))
     nt = notion.Notion(cfg["notion"]["data_source"]) if notion_on() else None
     if nt:
         notion_sync.read(db, nt, cfg, clock)
+    # after the ticks are read: a block ticked before the day turned is done, not missed,
+    # and a block's tick is never read as a task's last while an earlier one is still
+    # waiting to become missed (and be planned again)
+    forced = rollover(db, now, commit=not dry_run)
     state = planner_state(db, now)
     fp = fingerprint(busy, state)
     if fp == kv(db, "fingerprint") and not forced and not dry_run:

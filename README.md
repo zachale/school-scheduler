@@ -29,7 +29,7 @@ ssh vm 'cd f26-planner && ~/.local/bin/uv run service.py --once --dry-run'   # p
 | `gcal.py` | Google Calendar library used by the service (free/busy, batched keyed writes) |
 | `gcal.json` | The "F26 Plan" calendar's id |
 | `notion.py` | Notion client for Could Do (the F26 Planner connection) |
-| `notion_sync.py` | Reads ticks, deletions and Missed/Late OK from Could Do; writes a row per task and block |
+| `notion_sync.py` | Reads ticks, deletions and Missed/Late OK from Could Do; writes a row per block, under Zach's deliverable row |
 | `notion_map.py` | Maps the existing deliverable rows to planner tasks (used once, and daily after) |
 | `learn.py` | Learned pace: speed multipliers per kind of work, from finished measured tasks |
 | `deploy/` | systemd user unit and `deploy.sh` |
@@ -48,10 +48,11 @@ service replans within a minute. The translations are mechanical:
 | "that took longer / happened earlier" | drag or resize the ticked block in Notion Calendar: its size is the time spent |
 | "make this block shorter" | resize it (same start): it keeps that length, and the planner may still move it |
 | "I'll do this block then" | drag it to a new start: it is locked there and never moved again |
-| "I handed it in" | tick the deliverable row; its remaining blocks are cancelled |
+| "I handed it in" | tick your original row for it; its remaining blocks are cancelled |
+| "I finished this post / this week's review" | tick its last block, even if it ran short; a task with no row of its own is finished that way |
 | "I didn't do today's blocks" | nothing: a block still unticked when the day ends becomes Missed and its time is planned again. A Missed block stays on its slot; resizing it only changes the time it records if you tick it later |
-| "drop this task" | delete its row in Could Do; restoring it from the trash brings it back |
-| "keep working on it after the deadline" | set its Plan state to Late OK |
+| "drop this task" | delete its original row in Could Do (restoring it brings it back); a weekly review or catch-up has no row, so ask Claude |
+| "keep working on it after the deadline" | set its original row's Plan state to Late OK; for a task with no row, ask Claude |
 | "no weekends" | `work_hours.include_weekends: false` |
 | "I can work till 11 on weeknights" | `work_hours.overflow` |
 | "CIS 4020's project is a group project, halve it" | the `minutes` on `cis4020-proj` |
@@ -185,13 +186,20 @@ Rows the planner manages carry a `Plan ID`; nothing else in Could Do is read or 
 
 | Plan ID | Row | Ticking it means |
 |---|---|---|
-| `deadline:<task>[,<task>…]` | a deliverable Zach already had (51 of them, adopted on the first run) | handed in: its tasks are finished |
-| `task:<task>` | a planner task with no deliverable of its own, or one of several under a deliverable | that task is finished |
-| `session:<task>#<n>` | one calendar block, a sub-item of its task or deliverable | that block is done |
+| `deadline:<task>[,<task>…]` | a deliverable Zach already had (51 of them, adopted on the first run); its date is his, untouched | handed in: its tasks are finished |
+| `session:<task>#<n>` | one calendar block, a sub-item of the deliverable for its task (none for weekly reviews and catch-ups) | that block is done |
+
+Zach's own rows are the only task-level rows. A task with a row to itself (an assignment) is
+finished only by ticking that row: past its estimate it gets one 30-min wrap-up block, then
+waits. Every other task (the three posts under a discussion, midterm prep and sitting, the
+CIS 4020 analysis work under the Project Report, weekly reviews, catch-ups) is finished once
+its minutes are spent, or when its last planned block is ticked even if that block ran
+short; unticking that block reopens it. A task with no row that passes its target date stops
+being scheduled, and the warning says to ask Claude.
 
 Every cycle scans all Plan ID rows and diffs them against the service's SQLite record, because
 a "changed since" query cannot see deleted rows and Notion rounds edit times to the minute.
-Deleting a block's row replans it; deleting a task's or deliverable's row drops the task;
+Deleting a block's row replans it; deleting a deliverable row drops its tasks;
 restoring it from the trash brings it back. Notion holds the whole record (the service writes
 its own ticks and measured minutes back), so a lost `state.db` is rebuilt from a scan.
 
@@ -199,8 +207,7 @@ its own ticks and measured minutes back), so a lost `state.db` is rebuilt from a
 and Zach may drag or resize a block after ticking it to match what really happened. Before
 it is ticked, a resize keeps the block at that length (it can still move), and changing its
 start locks it where he put it. The service tells his edits from its own writes by the
-row's last editor and by the times it last wrote (`rows.w_start`/`w_end`). Task rows are
-all-day, so only blocks carry times.
+row's last editor and by the times it last wrote (`rows.w_start`/`w_end`).
 
 **Learned pace** (`learn.py`): a finished task whose blocks were mostly measured is evidence;
 each kind of work (readings, posts, reviews, exam prep, assignments per course) gets a

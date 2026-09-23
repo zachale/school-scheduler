@@ -57,10 +57,13 @@ def read(db, nt: notion.Notion, cfg: dict, now: dt.datetime) -> None:
         raise notion.NotionError(f"{len(gone)} of {len(known)} planner rows vanished from Could "
                                  "Do at once; not treating that as deletions")
 
+    imported = set()
     for plan_id, row in rows.items():
         kind, _, ident = plan_id.partition(":")
+        if kind not in ("deadline", "session"):
+            continue                          # not a row the service keeps
         before = known.get(plan_id)
-        if before is None and kind in ("task", "deadline"):
+        if before is None and kind == "deadline":
             for task in ident.split(","):     # back from the trash: the task is owed again
                 if db.execute("delete from dropped where task = ?", (task,)).rowcount:
                     log(f"row restored: {task} is back in the plan")
@@ -70,18 +73,22 @@ def read(db, nt: notion.Notion, cfg: dict, now: dt.datetime) -> None:
                    (plan_id, row["page_id"], int(bool(before and before["done"])), row["state"]))
         was_done = bool(before and before["done"])
         if kind == "session":
+            if db.execute("select 1 from sessions where id = ?", (ident,)).fetchone() is None:
+                imported.add(ident.rpartition("#")[0])
             _session_change(db, row, ident, was_done, now, grace, bot, before)
             if row["state"] == "Missed":
                 db.execute("update sessions set status = 'missed' where id = ? "
                            "and status = 'planned'", (ident,))
-        elif row["done"] != was_done and kind in ("task", "deadline"):
+        elif row["done"] != was_done:
             for task in ident.split(","):     # one deliverable can cover several tasks
                 _task_change(db, task, row["done"], now)
-        if kind in ("task", "deadline") and row["done"] and "," not in ident:
+        if kind == "deadline" and row["done"] and "," not in ident:
             # the whole task's time, typed into Actual min on its own row
             db.execute("update finished set actual = ? where task = ?",
                        (int(row["actual_min"]) if row["actual_min"] else None, ident))
         db.execute("update rows set done = ? where plan_id = ?", (int(row["done"]), plan_id))
+    for task in imported:
+        _refinish_rebuilt(db, task)
 
     for plan_id in gone:                      # confirm each one is really in the trash
         page_id = known[plan_id]["page_id"]
@@ -93,7 +100,7 @@ def read(db, nt: notion.Notion, cfg: dict, now: dt.datetime) -> None:
             db.execute("update sessions set status = 'cancelled' where id = ? "
                        "and status = 'planned'", (ident,))
             log(f"row deleted: block {ident} unscheduled, it will be planned again")
-        else:
+        elif kind == "deadline":
             for task in ident.split(","):
                 db.execute("insert or replace into dropped values (?, ?)", (task, str(now.date())))
                 db.execute("update sessions set status = 'cancelled' where task = ? "
@@ -125,6 +132,21 @@ def _import_session(db, row, sid, now) -> None:
                 status, planned if row["done"] else None,   # its size is its time
                 int(bool(row["done"])), json.dumps(block)))
     log(f"rebuilt block {sid} from Notion ({status})")
+
+
+def _refinish_rebuilt(db, task: str) -> None:
+    """After state.db was rebuilt from Notion: a task with no row of its own that has no
+    block still planned and whose latest block is ticked was finished by that block (the
+    service plans more blocks for anything still owed), so it stays finished even if that
+    block ran short. A latest block that was missed means the task ran out of time instead."""
+    if db.execute("select 1 from rows where plan_id = ?", (f"deadline:{task}",)).fetchone() or \
+            db.execute("select 1 from sessions where task = ? and status = 'planned'", (task,)).fetchone():
+        return
+    last = db.execute("select id, date, status from sessions where task = ? and status in "
+                      "('done', 'missed') order by date desc, \"end\" desc", (task,)).fetchone()
+    if last and last["status"] == "done" and db.execute("insert into finished (task, day, block) values (?, ?, ?) "
+                           "on conflict(task) do nothing", (task, last["date"], last["id"])).rowcount:
+        log(f"rebuilt: {task} finished by its last block {last['id']}")
 
 
 def _local(value: str | None) -> dt.datetime | None:
@@ -191,6 +213,8 @@ def _session_change(db, row, sid, was_done, now, grace, bot, known_row) -> None:
             db.execute("update sessions set status = ?, actual_min = null, measured = 0 "
                        "where id = ?", (status, sid))
             log(f"unchecked: {sid} is owed again" + (" (its slot has passed)" if status == "missed" else ""))
+            if db.execute("delete from finished where task = ? and block = ?", (s["task"], sid)).rowcount:
+                log(f"  {s['task']} is open again: that block had finished it")
         return
     if s["status"] == "done":
         return
@@ -203,6 +227,7 @@ def _session_change(db, row, sid, was_done, now, grace, bot, known_row) -> None:
                    "where id = ?", (size, int(edited), sid))
         log(f"done: {sid} (restored and ticked), {size} min")
         _cancel_replacements(db, s["task"], size, sid)
+        _finish_by_last_block(db, s["task"], sid)
         return
     # Notion's own edit time, unless the service made that edit; then it is only as
     # precise as this cycle
@@ -222,6 +247,25 @@ def _session_change(db, row, sid, was_done, now, grace, bot, known_row) -> None:
         # a missed block ticked late: its time was already re-planned, so give that back
         _cancel_replacements(db, s["task"], size, sid)
     log(f"done: {sid}, {size} min ({b_start:%a %H:%M}-{b_end:%H:%M})")
+    _finish_by_last_block(db, s["task"], sid)
+
+
+def _finish_by_last_block(db, task: str, sid: str) -> None:
+    """A task with no Could Do row of its own (a discussion post, a weekly review) is
+    finished by ticking its last block, even one that ran short: with no row to tick,
+    that block is its hand-in. A task with its own row waits for that row. The block is
+    the last only if none of the task is still planned and no missed block comes after
+    it (a task that ran out of time keeps its missed blocks, never planned again)."""
+    if db.execute("select 1 from rows where plan_id = ?", (f"deadline:{task}",)).fetchone():
+        return
+    b = db.execute("select date, start from sessions where id = ?", (sid,)).fetchone()
+    if db.execute("select 1 from sessions where task = ? and id <> ? and (status = 'planned' or "
+                  "(status = 'missed' and (date > ? or (date = ? and start > ?))))",
+                  (task, sid, b["date"], b["date"], b["start"])).fetchone():
+        return
+    if db.execute("insert into finished (task, day, block) values (?, ?, ?) "
+                  "on conflict(task) do nothing", (task, b["date"], sid)).rowcount:
+        log(f"finished: {task}, its last block ticked")
 
 
 def _cancel_replacements(db, task: str, minutes: int, sid: str) -> None:
@@ -239,7 +283,8 @@ def _cancel_replacements(db, task: str, minutes: int, sid: str) -> None:
 
 def _task_change(db, task: str, done: bool, now: dt.datetime) -> None:
     if done:
-        db.execute("insert or replace into finished (task, day) values (?, ?)", (task, str(now.date())))
+        db.execute("insert into finished (task, day) values (?, ?) on conflict(task) do nothing",
+                   (task, str(now.date())))
         # a block under way when it was handed in closes now; later ones are not needed
         today, hhmm = str(now.date()), f"{now:%H:%M}"
         for s in db.execute("select * from sessions where task = ? and status = 'planned' "
@@ -254,8 +299,14 @@ def _task_change(db, task: str, done: bool, now: dt.datetime) -> None:
                        (task, today, today, hhmm)).rowcount
         log(f"finished in Notion: {task}" + (f", {n} planned blocks cancelled" if n else ""))
     else:
-        db.execute("delete from finished where task = ?", (task,))
-        log(f"unfinished in Notion: {task} is owed again")
+        if db.execute("delete from finished where task = ? and block is null", (task,)).rowcount:
+            log(f"unfinished in Notion: {task} is owed again")
+
+
+def covered(db) -> set[str]:
+    """Tasks with a deliverable row of Zach's: their own, or one they share."""
+    return {t for r in db.execute("select plan_id from rows where plan_id like 'deadline:%'")
+            for t in r["plan_id"].split(":", 1)[1].split(",")}
 
 
 def state(db) -> dict:
@@ -263,6 +314,9 @@ def state(db) -> dict:
     return {
         "finished": [r["task"] for r in db.execute("select task from finished")],
         "dropped": [r["task"] for r in db.execute("select task from dropped")],
+        # tasks handed in by ticking their own row: past their estimate they wait for it
+        "hand_in": [r["plan_id"].split(":", 1)[1] for r in db.execute(
+            "select plan_id from rows where plan_id like 'deadline:%' and plan_id not like '%,%'")],
         "late_ok": [t for r in db.execute("select plan_id from rows where state = 'Late OK'")
                     for t in r["plan_id"].split(":", 1)[1].split(",")
                     if not r["plan_id"].startswith("session:")],
@@ -288,7 +342,9 @@ def _edited_since_scan(nt: notion.Notion, row: dict) -> bool:
 
 
 def write(db, nt: notion.Notion, cfg: dict, resolved: list[dict], now: dt.datetime) -> tuple:
-    """Make Could Do hold a row for every task and every planned block."""
+    """Make Could Do hold a row for every planned block, under Zach's deliverable row for
+    its task where there is one. His rows are the only task-level rows: ticking one hands
+    in its task(s), and a task with none is finished through its blocks."""
     tags = cfg["notion"]["course_tags"]
     if db.execute("select v from kv where k = 'adopted'").fetchone() is None or \
             json.loads(db.execute("select v from kv where k = 'adopted'").fetchone()[0]) != str(now.date()):
@@ -298,15 +354,8 @@ def write(db, nt: notion.Notion, cfg: dict, resolved: list[dict], now: dt.dateti
         db.commit()
     known, added, updated, trashed = _known(db), 0, 0, 0
     by_task = {t["id"]: t for t in resolved}
-    # a deliverable row Zach already had stands in for the task(s) it covers
-    parent_of, solo = {}, set()
-    for plan_id, row in known.items():
-        if plan_id.startswith("deadline:"):
-            ids = plan_id.split(":", 1)[1].split(",")
-            for tid in ids:
-                parent_of[tid] = row["page_id"]
-            if len(ids) == 1:
-                solo.add(ids[0])
+    parent_of = {tid: row["page_id"] for plan_id, row in known.items()
+                 if plan_id.startswith("deadline:") for tid in plan_id.split(":", 1)[1].split(",")}
 
     def remember(plan_id, page_id, props, times=(None, None)):
         # committed at once: Notion has already changed, so a later failure in this cycle
@@ -319,35 +368,7 @@ def write(db, nt: notion.Notion, cfg: dict, resolved: list[dict], now: dt.dateti
                    (plan_id, page_id, _hash(props), *times))
         db.commit()
 
-    # one row per task that still owes time (its parent deliverable row, where there is one)
-    for t in resolved:
-        if t["status"] not in ("scheduled", "overdue"):
-            continue
-        if t["id"] in solo:            # its own deliverable row already is its task row
-            continue
-        plan_id = f"task:{t['id']}"
-        props = {
-            "Name": title(f"{t['course']} — {t['title']}"),
-            "Plan ID": rich(plan_id),
-            # no date: a task row is only the parent of its blocks, which carry the times;
-            # the real deadline is on the deliverable row
-            "Due Date": {"date": None},
-            "Tags": {"multi_select": [{"name": "School"}, {"name": tags[t["course"]]}]},
-            "Plan state": {"select": {"name": "Late OK" if t["late"] else "Planned"}},
-        }
-        if t["id"] in parent_of:
-            props["Parent item"] = {"relation": [{"id": parent_of[t["id"]]}]}
-        row = known.get(plan_id)
-        if row is None:
-            remember(plan_id, nt.create(props), props)
-            added += 1
-        elif row["hash"] != _hash(props):
-            nt.update(row["page_id"], props)
-            remember(plan_id, row["page_id"], props)
-            updated += 1
-
-    known = _known(db)                  # includes the task rows just made, as parents
-    # one row per planned block, under its task's row
+    # one row per planned block
     for s in db.execute("select * from sessions where status = 'planned' and date >= ? "
                         "order by date, start", (str(now.date()),)):
         t = by_task.get(s["task"])
@@ -356,8 +377,7 @@ def write(db, nt: notion.Notion, cfg: dict, resolved: list[dict], now: dt.dateti
         plan_id = f"session:{s['id']}"
         start = dt.datetime.fromisoformat(f"{s['date']}T{s['start']}")
         end = dt.datetime.fromisoformat(f"{s['date']}T{s['end']}")
-        task_row = known.get(f"task:{s['task']}")
-        parent_page = task_row["page_id"] if task_row else parent_of.get(s["task"])
+        parent_page = parent_of.get(s["task"])
         props = {
             "Name": title(f"{t['course']} · {t['title']} — block {s['seq']}"),
             "Plan ID": rich(plan_id),
@@ -365,9 +385,9 @@ def write(db, nt: notion.Notion, cfg: dict, resolved: list[dict], now: dt.dateti
             "Planned min": {"number": int((end - start).total_seconds() // 60)},
             "Tags": {"multi_select": [{"name": "School"}, {"name": tags[t["course"]]}]},
             "Plan state": {"select": {"name": "Planned"}},
+            # a weekly review or catch-up has no deliverable row: its blocks stand alone
+            "Parent item": {"relation": [{"id": parent_page}] if parent_page else []},
         }
-        if parent_page:
-            props["Parent item"] = {"relation": [{"id": parent_page}]}
         row = known.get(plan_id)
         times = _times(s)
         if row is None:
@@ -405,24 +425,6 @@ def write(db, nt: notion.Notion, cfg: dict, resolved: list[dict], now: dt.dateti
                    (*times, plan_id))
         db.commit()
         updated += 1
-
-    # a task row mirrors its task when it was finished or dropped through another row
-    status = {t["id"]: t["status"] for t in resolved}
-    dropped = {r["task"] for r in db.execute("select task from dropped")}
-    for plan_id, row in list(known.items()):
-        if not plan_id.startswith("task:"):
-            continue
-        tid = plan_id.split(":", 1)[1]
-        if tid in dropped:
-            nt.trash(row["page_id"])
-            db.execute("delete from rows where plan_id = ?", (plan_id,))
-            db.commit()
-            trashed += 1
-        elif status.get(tid) == "finished" and row["hash"] != "finished":
-            nt.update(row["page_id"], {"Done": {"checkbox": True}, "Due Date": {"date": None}})
-            db.execute("update rows set done = 1, hash = 'finished' where plan_id = ?", (plan_id,))
-            db.commit()
-            updated += 1
 
     # blocks that are no longer planned lose their row
     live = {f"session:{r['id']}" for r in db.execute(

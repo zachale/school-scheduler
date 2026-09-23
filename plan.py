@@ -320,10 +320,14 @@ def apply_state(tasks: list[dict], state: dict):
     aside what needs no more time. Returns the tasks still owed time and the closed ones
     (each with _status finished | dropped | awaiting, and _finished_on).
 
-    A hand-in ("work") is finished when Zach checks it off, not when its minutes run
-    out: past its estimate it gets one short wrap-up session, then waits ("awaiting")."""
+    A hand-in ("work") with a Could Do row of its own is finished when Zach checks that
+    row off, not when its minutes run out: past its estimate it gets one short wrap-up
+    session, then waits ("awaiting"). Anything else is finished once its minutes are
+    spent. state["hand_in"] lists the tasks with their own row; without it (no Notion),
+    every hand-in waits for its check."""
     done, last = state.get("done") or {}, state.get("last_done") or {}
     finished_ids = set(state.get("finished") or [])
+    hand_in = state.get("hand_in")
     dropped_ids = set(state.get("dropped") or [])
     wrapped = state.get("wrapped") or {}       # wrap-up minutes already spent or under way
     speed = state.get("multiplier") or {}
@@ -346,7 +350,7 @@ def apply_state(tasks: list[dict], state: dict):
             status = "finished"
         elif left <= 0:
             spare = WRAPUP_MINUTES - int(wrapped.get(t["id"], 0))
-            if t["kind"] != "work":
+            if t["kind"] != "work" or (hand_in is not None and t["id"] not in hand_in):
                 status = "finished"            # its minutes are the whole job
             elif spare <= 0:
                 status = "awaiting"            # wrapped up; waiting to be handed in

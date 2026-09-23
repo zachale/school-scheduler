@@ -40,8 +40,9 @@ def evidence(db, resolved: list[dict], base: dict[str, int]) -> dict[str, list[t
         if total and total["actual"]:
             out.setdefault(group(t), []).append((total["actual"], base[t["id"]], t["id"]))
             continue
+        # a missed block's time went to later blocks, so only planned ones are still to come
         open_blocks = db.execute("select count(*) c from sessions where task = ? and "
-                                 "status in ('planned', 'missed')", (t["id"],)).fetchone()["c"]
+                                 "status = 'planned'", (t["id"],)).fetchone()["c"]
         if open_blocks:
             continue                  # still has blocks to come: not evidence yet
         rows = db.execute("select planned_min, actual_min, measured from sessions "

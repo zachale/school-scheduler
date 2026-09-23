@@ -59,12 +59,15 @@ within 5 min.
 
 | Row | Represents | Checking it means |
 |---|---|---|
-| Deliverable (the 51 rows mapped today) | a due date: assignment, discussion close, exam | submitted: every open session under it is cancelled |
-| Task (new sub-row where one deliverable covers several tasks: ENVS posts 1–3, ENVS midterm prep and sit; plus planner-only rows for weekly reviews, CIS*4020 analysis work, catch-up) | one planner task | that task is finished |
-| Session (new sub-item, ~220 over the term) | one calendar block; `Due Date` = block start–end | that block is done |
+| Deliverable (Zach's 51 original rows, dates untouched) | a due date: assignment, discussion close, exam | submitted: every task it covers is finished and its open sessions cancelled |
+| Session (new sub-item of its deliverable, ~220 over the term) | one calendar block; `Due Date` = block start–end | that block is done |
 
-- Every planner task has exactly one row that finishes it. In the 1:1 cases that row is the
-  deliverable itself.
+- Zach's original rows are the only task-level rows (revised 2026-09-22: an earlier build
+  added a row per planner task, which duplicated them). A task with a deliverable to itself
+  is finished by that row. Every other task (ENVS posts and midterm parts, CIS*4020 analysis
+  work under the Project Report, weekly reviews, catch-up) is finished when its minutes are
+  spent or its last planned session is checked, even short; unchecking that session reopens
+  it. Weekly reviews are one session each.
 - Every row the planner manages carries a `Plan ID`. Rows without one are Zach's and are never
   touched.
 - **Session identity** is the task plus a sequence number that is never reused.
@@ -96,13 +99,14 @@ never writes to a session row between its start and the end of its grace window.
 - **Missed:** at the 00:05 rollover, an unchecked block from the previous day is set to
   Missed. It stays on its slot, and its minutes go to new session rows. Checking a Missed row
   later counts it as done late and cancels that many replacement minutes.
-- **Submitting mid-session:** checking a deliverable or task row while one of its sessions is
+- **Submitting mid-session:** checking a deliverable row while one of its sessions is
   running first closes that session at the check time.
 - **Unchecking** a row reverts it on the next cycle.
-- **Past its estimate,** a task gets at most one 30-min wrap-up session, then waits for its row
-  to be checked.
+- **Past its estimate,** a task with its own deliverable row gets at most one 30-min wrap-up
+  session, then waits for that row to be checked.
 - **Deadline passed, row unchecked:** the task stops being scheduled and an alert is raised.
-  Setting `Plan state` to Late OK keeps scheduling it as overdue work.
+  Setting `Plan state` to Late OK keeps scheduling it as overdue work. A task with no row of
+  its own cannot be marked Late OK in Notion; the alert says to ask Claude.
 
 ## Learning estimates
 
@@ -128,7 +132,7 @@ never writes to a session row between its start and the end of its grace window.
 
 - **Session row deleted:** the block is unscheduled and recreated with the next plan. A
   logged actual, if the row was checked, is kept.
-- **Deliverable or task row deleted:** the task is dropped from the plan, like "I'm dropping
+- **Deliverable row deleted:** its tasks are dropped from the plan, like "I'm dropping
   A5". Restoring the row from Notion's trash brings the task back.
 - **Many rows disappear at once:** if more than 5 known rows vanish in one cycle, or a known
   row returns 404 instead of being in the trash, the service treats it as a failure and drops

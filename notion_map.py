@@ -41,8 +41,10 @@ def targets(name):
     if c == "cis4020":
         for key, tid in [("Assignment 1", "a1"), ("Assignment 2", "a2"), ("Project Proposal", "prop"),
                          ("Tutorial Notebook", "nb"), ("Project Presentation", "pres"),
-                         ("Project Report", "rep"), ("Midterm", "mt")]:
+                         ("Midterm", "mt")]:
             if rest.startswith(key): return [f"cis4020-{tid}"]
+        # the report is handed in with the analysis work behind it
+        if rest.startswith("Project Report"): return ["cis4020-proj", "cis4020-rep"]
     if m := re.match(r"Assignment #?(\d)", rest): return [f"{c}-a{m[1]}"]
     if m := re.match(r"Midterm #(\d)", rest): return [f"{c}-mt{m[1]}"]
     if rest.startswith("Midterm"): return [f"{c}-mt"]
