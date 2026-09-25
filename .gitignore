@@ -1,4 +1,9 @@
-# Produced on the VM by service.py; local copies are only previews
+# personal inputs and generated plans: deployed separately, never committed
+config.yaml
+tasks.yaml
+events.yaml
+gcal.json
+notion_rows.tsv
 busy.json
 state.json
 schedule.json
