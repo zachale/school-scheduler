@@ -4,16 +4,17 @@
 # ///
 """The F26 autoplanner: keeps the plan and the "F26 Plan" calendar current, no LLM.
 
-Runs on the VM under systemd (deploy/f26-planner.service). Every cycle it:
+One run is one cycle; systemd timers run it (deploy/). A cycle:
 
-  1. rolls yesterday over at 00:05, turning its sessions into history;
-  2. reads the planner inputs and Zach's free/busy;
+  1. reads the planner inputs, Zach's free/busy and every Could Do row with a Plan ID;
+  2. rolls earlier days over once the date has turned, turning their blocks into history;
   3. if anything changed, replans from now (plan.py) and checks the result (verify.py);
-  4. matches the new blocks to stable session ids and writes the calendar differences.
+  4. matches the new blocks to stable session ids and writes the differences.
 
-    uv run service.py                    # loop forever
-    uv run service.py --once             # one cycle, then exit
-    uv run service.py --once --dry-run   # plan and diff, write nothing
+    uv run service.py poll               # every minute: replan only if something changed
+    uv run service.py sweep              # daily: also replan anyway, adopt new deliverable
+                                         # rows, rewrite every block row, refresh the stats
+    uv run service.py poll --dry-run     # plan and diff, write nothing
 
 Once the Notion token is on the VM, Could Do is the only "done" signal: a block checked
 off is done (and trimmed to the moment it was checked), a block still unchecked when its
@@ -27,13 +28,13 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import fcntl
 import hashlib
 import json
 import shutil
 import sqlite3
 import subprocess
 import sys
-import time
 import traceback
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -53,8 +54,7 @@ INPUTS = ["config.yaml", "tasks.yaml", "events.yaml", "plan.py", "verify.py"]
 WATCHED = INPUTS + ["service.py", "gcal.py", "gcal.json", "notion.py", "notion_sync.py",
                     "notion_map.py", "learn.py"]
 TZ = ZoneInfo("America/Toronto")
-CYCLE_SECONDS = 60
-ALERT_AFTER = 5            # consecutive failed cycles before an alert event
+ALERT_AFTER = 5            # consecutive failed runs before an alert event
 ALERT_KEY = "alert"
 
 
@@ -377,7 +377,8 @@ def calendar_id() -> str:
 
 
 # ---------- the cycle --------------------------------------------------------
-def cycle(db, svc, dry_run: bool) -> None:
+def cycle(db, svc, dry_run: bool, sweep: bool = False) -> None:
+    """One poll, or with sweep=True the daily full pass."""
     clock = local_now()
     # never round past midnight: today's sessions must stay today's
     now = min(round_up(clock), clock.replace(hour=23, minute=59))
@@ -393,7 +394,7 @@ def cycle(db, svc, dry_run: bool) -> None:
     forced = rollover(db, now, commit=not dry_run)
     state = planner_state(db, now)
     fp = fingerprint(busy, state)
-    if fp == kv(db, "fingerprint") and not forced and not dry_run:
+    if fp == kv(db, "fingerprint") and not (forced or sweep or dry_run):
         return                        # nothing changed; an alert, if any, still stands
     try:
         schedule, resolved = run_planner(busy, state)
@@ -419,12 +420,15 @@ def cycle(db, svc, dry_run: bool) -> None:
         db.rollback()
         return
     if nt:
-        added, updated, trashed = notion_sync.write(db, nt, cfg, resolved, now)
+        if sweep:                            # deliverable rows Zach added since yesterday
+            notion_sync.adopt(db, nt, {t["id"] for t in resolved})
+        added, updated, trashed = notion_sync.write(db, nt, cfg, resolved, now, full=sweep)
         log(f"  notion rows: add {added} · update {updated} · trash {trashed}")
-        try:
-            write_stats(db, nt, cfg, resolved, state)
-        except Exception as e:               # the stats page is a report, never a blocker
-            log(f"stats page not updated: {e}")
+        if sweep:
+            try:
+                write_stats(db, nt, cfg, resolved, state)
+            except Exception as e:           # the stats page is a report, never a blocker
+                log(f"stats page not updated: {e}")
     clear_alert(db, svc)
     set_kv(db, "fingerprint", fp)
     set_kv(db, "resolved", resolved)
@@ -433,35 +437,38 @@ def cycle(db, svc, dry_run: bool) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--once", action="store_true", help="run one cycle and exit")
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("mode", choices=["poll", "sweep"],
+                    help="poll: replan if anything changed; sweep: the daily full pass")
     ap.add_argument("--dry-run", action="store_true", help="plan and diff, write nothing")
     args = ap.parse_args()
+    STATE.mkdir(parents=True, exist_ok=True)
+    lock = open(STATE / "run.lock", "w")
+    try:
+        # a sweep waits for a poll under way; a poll skips while anything else runs
+        fcntl.flock(lock, fcntl.LOCK_EX | (0 if args.mode == "sweep" else fcntl.LOCK_NB))
+    except BlockingIOError:
+        return
     db = open_db()
     svc = gcal.service()
-    log(f"f26 autoplanner started ({'dry run' if args.dry_run else 'live'})")
-    while True:
-        started = time.monotonic()
-        try:
-            cycle(db, svc, args.dry_run)
-            if kv(db, "failures", 0) and not args.dry_run:
-                log("recovered")
-            set_kv(db, "failures", 0)
-            db.commit()
-        except Exception as e:                  # never exit on an API error
-            db.rollback()
-            n = kv(db, "failures", 0) + 1
-            set_kv(db, "failures", n)
-            db.commit()
-            log(f"cycle failed ({n} in a row): {e}\n{traceback.format_exc(limit=3)}")
-            if n >= ALERT_AFTER and not args.dry_run:
-                try:
-                    raise_alert(db, svc, local_now(), f"{n} failed cycles in a row: {e}")
-                except Exception as e2:
-                    log(f"could not raise the alert on the calendar either: {e2}")
-        if args.once:
-            return
-        time.sleep(max(5, CYCLE_SECONDS - (time.monotonic() - started)))
+    try:
+        cycle(db, svc, args.dry_run, sweep=args.mode == "sweep")
+        if kv(db, "failures", 0) and not args.dry_run:
+            log("recovered")
+        set_kv(db, "failures", 0)
+        db.commit()
+    except Exception as e:                      # counted, so a blip is not an alert
+        db.rollback()
+        n = kv(db, "failures", 0) + 1
+        set_kv(db, "failures", n)
+        db.commit()
+        log(f"{args.mode} failed ({n} in a row): {e}\n{traceback.format_exc(limit=3)}")
+        if n >= ALERT_AFTER and not args.dry_run:
+            try:
+                raise_alert(db, svc, local_now(), f"{n} failed runs in a row: {e}")
+            except Exception as e2:
+                log(f"could not raise the alert on the calendar either: {e2}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

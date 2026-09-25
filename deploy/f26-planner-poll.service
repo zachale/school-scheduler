@@ -1,0 +1,12 @@
+[Unit]
+Description=F26 planner: poll Notion and the calendar, replan if anything changed
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=TZ=America/Toronto
+WorkingDirectory=%h/school-scheduler
+ExecStart=%h/.local/bin/uv run --quiet %h/school-scheduler/service.py poll
+TimeoutStartSec=15min
+MemoryMax=400M

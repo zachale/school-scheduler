@@ -1,0 +1,9 @@
+[Unit]
+Description=Run the F26 planner full sweep daily, just after midnight Toronto time
+
+[Timer]
+OnCalendar=*-*-* 00:05:00 America/Toronto
+Persistent=true
+
+[Install]
+WantedBy=timers.target

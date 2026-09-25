@@ -25,12 +25,25 @@ and exam prep session around your Google Calendar, puts the blocks in a Notion d
 
 | File | Role |
 |---|---|
-| `service.py` | Runs a cycle: read Notion and free/busy, replan, verify, write |
+| `service.py` | One run: `poll` (replan if anything changed) or `sweep` (the daily full pass) |
 | `plan.py`, `verify.py` | The planner and its rule checker |
 | `notion.py`, `notion_sync.py`, `notion_map.py` | Notion client and row sync |
 | `gcal.py` | Google free/busy and the warnings calendar |
 | `learn.py` | Learned pace multipliers |
+| `deploy/` | systemd units and timers, and `install.sh` |
 | `PRD-autoplanner.md` | Design notes |
+
+## How it runs
+
+Two systemd user timers run the same script:
+
+| Timer | Runs | Does |
+|---|---|---|
+| `f26-planner-poll.timer` | every minute | `service.py poll`: reads Notion and free/busy, replans only if something changed |
+| `f26-planner-sweep.timer` | 00:05 Toronto, daily (catches up after downtime) | `service.py sweep`: turns the day over, adopts new deliverable rows, replans anyway, rewrites every block row, refreshes the stats page |
+
+A lock file keeps the two from overlapping. Install with `deploy/install.sh` on the host;
+`uv run service.py poll --dry-run` plans and diffs without writing.
 
 ## Setup
 

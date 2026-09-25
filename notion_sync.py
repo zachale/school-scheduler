@@ -341,17 +341,13 @@ def _edited_since_scan(nt: notion.Notion, row: dict) -> bool:
     return False
 
 
-def write(db, nt: notion.Notion, cfg: dict, resolved: list[dict], now: dt.datetime) -> tuple:
+def write(db, nt: notion.Notion, cfg: dict, resolved: list[dict], now: dt.datetime,
+          full: bool = False) -> tuple:
     """Make Could Do hold a row for every planned block, under Zach's deliverable row for
     its task where there is one. His rows are the only task-level rows: ticking one hands
-    in its task(s), and a task with none is finished through its blocks."""
+    in its task(s), and a task with none is finished through its blocks. With full=True
+    (the daily sweep) every block row is rewritten, repairing any that drifted."""
     tags = cfg["notion"]["course_tags"]
-    if db.execute("select v from kv where k = 'adopted'").fetchone() is None or \
-            json.loads(db.execute("select v from kv where k = 'adopted'").fetchone()[0]) != str(now.date()):
-        adopt(db, nt, {t["id"] for t in resolved})     # daily, so a partial run catches up
-        db.execute("insert into kv values ('adopted', ?) on conflict(k) do update set v = "
-                   "excluded.v", (json.dumps(str(now.date())),))
-        db.commit()
     known, added, updated, trashed = _known(db), 0, 0, 0
     by_task = {t["id"]: t for t in resolved}
     parent_of = {tid: row["page_id"] for plan_id, row in known.items()
@@ -393,7 +389,7 @@ def write(db, nt: notion.Notion, cfg: dict, resolved: list[dict], now: dt.dateti
         if row is None:
             remember(plan_id, nt.create(props), props, times)
             added += 1
-        elif row["hash"] != _hash(props) or (row["w_start"], row["w_end"]) != times:
+        elif full or row["hash"] != _hash(props) or (row["w_start"], row["w_end"]) != times:
             if _edited_since_scan(nt, row):
                 continue
             nt.update(row["page_id"], props)
@@ -415,7 +411,7 @@ def write(db, nt: notion.Notion, cfg: dict, resolved: list[dict], now: dt.dateti
         plan_id = f"session:{s_['id']}"
         row = known.get(plan_id)
         times = _times(s_)
-        if row is None or (row["done"] and (row["w_start"], row["w_end"]) == times):
+        if row is None or (not full and row["done"] and (row["w_start"], row["w_end"]) == times):
             continue
         if _edited_since_scan(nt, row):
             continue

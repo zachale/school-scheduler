@@ -1,0 +1,12 @@
+[Unit]
+Description=F26 planner: daily full sweep (day turnover, forced replan, rewrite every block row)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=TZ=America/Toronto
+WorkingDirectory=%h/school-scheduler
+ExecStart=%h/.local/bin/uv run --quiet %h/school-scheduler/service.py sweep
+TimeoutStartSec=45min
+MemoryMax=400M
