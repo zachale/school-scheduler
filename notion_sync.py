@@ -67,10 +67,11 @@ def read(db, nt: notion.Notion, cfg: dict, now: dt.datetime) -> None:
             for task in ident.split(","):     # back from the trash: the task is owed again
                 if db.execute("delete from dropped where task = ?", (task,)).rowcount:
                     log(f"row restored: {task} is back in the plan")
-        db.execute("insert into rows(plan_id, page_id, hash, done, state) "
-                   "values (?, ?, '', ?, ?) on conflict(plan_id) do update set "
+        db.execute("insert into rows(plan_id, page_id, hash, done, state, skip) "
+                   "values (?, ?, '', ?, ?, ?) on conflict(plan_id) do update set "
                    "page_id = excluded.page_id, state = excluded.state",
-                   (plan_id, row["page_id"], int(bool(before and before["done"])), row["state"]))
+                   (plan_id, row["page_id"], int(bool(before and before["done"])), row["state"],
+                    int(bool(before and before["skip"]))))
         was_done = bool(before and before["done"])
         if kind == "session":
             if db.execute("select 1 from sessions where id = ?", (ident,)).fetchone() is None:
@@ -86,7 +87,10 @@ def read(db, nt: notion.Notion, cfg: dict, now: dt.datetime) -> None:
             # the whole task's time, typed into Actual min on its own row
             db.execute("update finished set actual = ? where task = ?",
                        (int(row["actual_min"]) if row["actual_min"] else None, ident))
-        db.execute("update rows set done = ? where plan_id = ?", (int(row["done"]), plan_id))
+        if row["skip"] != bool(before and before["skip"]):   # after its drags and ticks
+            _skip_change(db, kind, ident, row, now)
+        db.execute("update rows set done = ?, skip = ? where plan_id = ?",
+                   (int(row["done"]), int(row["skip"]), plan_id))
     for task in imported:
         _refinish_rebuilt(db, task)
 
@@ -103,11 +107,63 @@ def read(db, nt: notion.Notion, cfg: dict, now: dt.datetime) -> None:
         elif kind == "deadline":
             for task in ident.split(","):
                 db.execute("insert or replace into dropped values (?, ?)", (task, str(now.date())))
-                db.execute("update sessions set status = 'cancelled' where task = ? "
-                           "and status = 'planned' and (date > ? or (date = ? and start >= ?))",
-                           (task, str(now.date()), str(now.date()), f"{now:%H:%M}"))
             log(f"row deleted: {ident} dropped from the plan")
+    _sync_dropped(db, now)
     db.commit()
+
+
+def _skip_change(db, kind: str, ident: str, row: dict, now: dt.datetime) -> None:
+    """Zach ticked or cleared Skip. On his deliverable row it drops or restores the tasks
+    the row covers; on a block it drops or restores that block's time. The row stays in
+    Could Do either way, hidden from his lists, as the record of what he dropped."""
+    if kind == "deadline":
+        for task in ident.split(","):
+            if row["skip"]:
+                db.execute("insert or replace into dropped values (?, ?)", (task, str(now.date())))
+            else:
+                db.execute("delete from dropped where task = ?", (task,))
+        log(f"{'skipped' if row['skip'] else 'unskipped'}: {ident} "
+            f"{'dropped from' if row['skip'] else 'back in'} the plan")
+        return
+    s = db.execute("select * from sessions where id = ?", (ident,)).fetchone()
+    if s is None:
+        return
+    if row["skip"] and not row["done"] and s["status"] in ("planned", "missed"):
+        db.execute("update sessions set status = 'skipped' where id = ?", (ident,))
+        log(f"skipped: block {ident}, its {minutes_of(s)} min are not planned again")
+    elif not row["skip"] and s["status"] == "skipped":
+        end = dt.datetime.fromisoformat(_times(s)[1])
+        status = "missed" if end <= now else "planned"
+        db.execute("update sessions set status = ? where id = ?", (status, ident))
+        log(f"unskipped: block {ident} is owed again ({status})")
+
+
+def minutes_of(s) -> int:
+    a, b = (dt.datetime.fromisoformat(t) for t in _times(s))
+    return int((b - a).total_seconds() // 60)
+
+
+def _sync_dropped(db, now: dt.datetime) -> None:
+    """A dropped task (its row skipped or deleted) keeps its past blocks as history, marked
+    dropped (and skipped in Notion, so they leave his lists too); its future blocks go. When
+    the task comes back, those past blocks are missed again and new blocks are planned."""
+    today, hhmm = str(now.date()), f"{now:%H:%M}"
+    dropped = {r["task"] for r in db.execute("select task from dropped")}
+    n = m = 0
+    for s in db.execute("select * from sessions where status in ('planned', 'missed', 'dropped')").fetchall():
+        future = s["date"] > today or (s["date"] == today and s["start"] > hhmm)
+        over = s["date"] < today or (s["date"] == today and s["end"] <= hhmm)
+        if s["task"] in dropped and s["status"] == "planned" and future:
+            db.execute("update sessions set status = 'cancelled' where id = ?", (s["id"],))
+            n += 1
+        elif s["task"] in dropped and (s["status"] == "missed" or (s["status"] == "planned" and over)):
+            db.execute("update sessions set status = 'dropped' where id = ?", (s["id"],))
+            n += 1
+        elif s["task"] not in dropped and s["status"] == "dropped":
+            db.execute("update sessions set status = 'missed' where id = ?", (s["id"],))
+            m += 1
+    if n or m:
+        log(f"dropped tasks: {n} blocks set aside, {m} brought back")
 
 
 def _import_session(db, row, sid, now) -> None:
@@ -122,7 +178,8 @@ def _import_session(db, row, sid, now) -> None:
     planned = int((end - start).total_seconds() // 60)       # its size on the calendar
     course, _, rest = row["name"].partition(" · ")
     title_ = rest.rsplit(" — block", 1)[0]
-    status = "done" if row["done"] else ("missed" if start < now else "planned")
+    status = ("done" if row["done"] else "skipped" if row["skip"]
+              else "missed" if start < now else "planned")
     block = {"start": f"{start:%H:%M}", "end": f"{end:%H:%M}", "title": title_, "cat": course,
              "course": course, "task": task, "kind": "", "overflow": False, "due": "",
              "note": ""}
@@ -193,7 +250,9 @@ def _session_change(db, row, sid, was_done, now, grace, bot, known_row) -> None:
             db.execute("update sessions set measured = 1 where id = ?", (sid,))
             log(f"edited: {sid} now {start:%a %H:%M}-{end:%H:%M} ({size} min)")
         elif moved:
-            db.execute("update sessions set status = 'planned' where id = ?", (sid,))
+            # a missed block dragged ahead is owed there; a skipped one stays skipped
+            db.execute("update sessions set status = 'planned' where id = ? and "
+                       "status in ('planned', 'missed')", (sid,))
             log(f"moved: {sid} locked at {start:%a %H:%M}-{end:%H:%M}")
         elif s["status"] == "missed":
             # its time was already planned again; the new size is what it records if ticked
@@ -334,7 +393,8 @@ def _edited_since_scan(nt: notion.Notion, row: dict) -> bool:
         return True                               # trashed meanwhile: the next scan sees it
     start, end = _local(live["start"]), _local(live["end"])
     shown = (start and f"{start:%Y-%m-%dT%H:%M}", end and f"{end:%Y-%m-%dT%H:%M}")
-    changed = shown != (row["w_start"], row["w_end"]) or live["done"] != bool(row["done"])
+    changed = (shown != (row["w_start"], row["w_end"]) or live["done"] != bool(row["done"])
+               or live["skip"] != bool(row["skip"]))
     if changed and live["edited_by"] != nt.me():
         log(f"{row['plan_id']} changed in Notion during this cycle; the next one reads it")
         return True
@@ -422,9 +482,22 @@ def write(db, nt: notion.Notion, cfg: dict, resolved: list[dict], now: dt.dateti
         db.commit()
         updated += 1
 
+    # a dropped task's blocks are skipped too; brought back, they are cleared
+    for s in db.execute("select id, status from sessions where status in ('dropped', 'missed', "
+                        "'planned')").fetchall():
+        row = known.get(f"session:{s['id']}")
+        want = s["status"] == "dropped"
+        if row is None or bool(row["skip"]) == want or _edited_since_scan(nt, row):
+            continue
+        nt.update(row["page_id"], {"Skip": {"checkbox": want}})
+        db.execute("update rows set skip = ? where plan_id = ?", (int(want), f"session:{s['id']}"))
+        db.commit()
+        updated += 1
+
     # blocks that are no longer planned lose their row
     live = {f"session:{r['id']}" for r in db.execute(
-        "select id from sessions where status in ('planned', 'done', 'missed')")}
+        "select id from sessions where status in ('planned', 'done', 'missed', 'skipped', "
+        "'dropped')")}
     for plan_id, row in known.items():
         if plan_id.startswith("session:") and plan_id not in live:
             nt.trash(row["page_id"])

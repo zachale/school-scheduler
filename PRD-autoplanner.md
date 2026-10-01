@@ -80,6 +80,8 @@ within 5 min.
   - `Plan ID` (text).
   - `Planned min` and `Actual min` (numbers). `Actual min` is an optional manual override.
   - `Plan state` (select: Planned, Missed, Late OK).
+  - `Skip` (checkbox, added 2026-09-30): dropped, but kept. Zach's lists hide skipped rows;
+    a "Skipped" view is the record of what he dropped.
   - The unnamed checkbox is renamed `Done`. The service addresses every property by ID, and
     M2 updates the `tracking-could-dos` skill so Claude's could-do commands keep working and
     its daily brief leaves session rows out.
@@ -134,6 +136,10 @@ never writes to a session row between its start and the end of its grace window.
   logged actual, if the row was checked, is kept.
 - **Deliverable row deleted:** its tasks are dropped from the plan, like "I'm dropping
   A5". Restoring the row from Notion's trash brings the task back.
+- **Skip ticked:** the same without deleting anything. On a deliverable row its tasks are
+  dropped: future sessions go, past missed ones are skipped too (and come back with it).
+  On a session row that session's time is dropped and not planned again. Unticking undoes
+  either. A task with any skipped session is not learning evidence.
 - **Many rows disappear at once:** if more than 5 known rows vanish in one cycle, or a known
   row returns 404 instead of being in the trash, the service treats it as a failure and drops
   nothing.

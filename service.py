@@ -72,13 +72,14 @@ def round_up(t: dt.datetime, step: int = 5) -> dt.datetime:
 
 
 # ---------- state ------------------------------------------------------------
-SCHEMA = 5         # bump when a table changes; add the in-place step to MIGRATIONS
+SCHEMA = 6         # bump when a table changes; add the in-place step to MIGRATIONS
 MIGRATIONS = {     # from version -> statements that bring it to the next one
     3: ["alter table sessions add column locked integer not null default 0",
         "alter table sessions add column user_min integer",
         "alter table rows add column w_start text",
         "alter table rows add column w_end text"],
     4: ["alter table finished add column block text"],
+    5: ["alter table rows add column skip integer not null default 0"],
 }
 
 
@@ -112,7 +113,8 @@ def open_db() -> sqlite3.Connection:
             start       text not null,
             "end"       text not null,     -- trimmed to the check time when done early
             planned_min integer not null,  -- the block as planned; what "done" counts
-            status      text not null,     -- planned | done | missed | cancelled
+            status      text not null,     -- planned | done | missed | cancelled | skipped
+                                           -- (Zach ticked Skip) | dropped (its task is)
             actual_min  integer,           -- measured, or planned when not measurable
             measured    integer not null default 0,
             off_plan    integer not null default 0,  -- (unused since v4; kept for old rows)
@@ -124,7 +126,8 @@ def open_db() -> sqlite3.Connection:
         create table if not exists rows (      -- Could Do rows carrying a Plan ID
             plan_id text primary key, page_id text not null, hash text not null,
             done integer not null default 0, state text,
-            w_start text, w_end text);     -- a block row's times as the service last wrote them
+            w_start text, w_end text,      -- a block row's times as the service last wrote them
+            skip integer not null default 0);  -- its Skip box, as last read or written
         create table if not exists finished (task text primary key, day text not null,
                                              actual integer,   -- total minutes, if typed in
                                              block text);      -- the block whose tick finished
@@ -185,6 +188,9 @@ def planner_state(db, now: dt.datetime) -> dict:
     for r in db.execute("select * from sessions where status = 'done'"):
         done[r["task"]] = done.get(r["task"], 0) + minutes(r)
         last[r["task"]] = max(last.get(r["task"], r["date"]), r["date"])
+    # a block Zach skipped: its time is dropped from the task, not planned again
+    for r in db.execute("select * from sessions where status = 'skipped'"):
+        done[r["task"]] = done.get(r["task"], 0) + minutes(r)
     # a task finished through its row, with no block of its own, dates from that row
     # (discussion-post spacing counts from it)
     for r in db.execute("select task, day from finished"):

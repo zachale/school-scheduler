@@ -84,7 +84,7 @@ class Notion:
         """Fail the cycle, rather than misread every row, if a column was renamed."""
         props = self.call("GET", f"/data_sources/{self.ds}")["properties"]
         missing = [p for p in ("Name", "Done", "Plan ID", "Due Date", "Planned min", "Actual min",
-                               "Plan state", "Parent item", "Tags") if p not in props]
+                               "Plan state", "Parent item", "Tags", "Skip") if p not in props]
         if missing:
             raise NotionError(f"Could Do is missing {missing}; was a column renamed?")
 
@@ -146,6 +146,7 @@ def parse_row(page: dict) -> dict:
     return {
         "page_id": page["id"], "plan_id": text("Plan ID"), "name": title,
         "done": bool(p.get("Done", {}).get("checkbox")),
+        "skip": bool(p.get("Skip", {}).get("checkbox")),
         "planned_min": p.get("Planned min", {}).get("number"),
         "actual_min": p.get("Actual min", {}).get("number"),
         "state": select("Plan state"),

@@ -45,6 +45,9 @@ def evidence(db, resolved: list[dict], base: dict[str, int]) -> dict[str, list[t
                                  "status = 'planned'", (t["id"],)).fetchone()["c"]
         if open_blocks:
             continue                  # still has blocks to come: not evidence yet
+        if db.execute("select 1 from sessions where task = ? and status = 'skipped'",
+                      (t["id"],)).fetchone():
+            continue                  # part of it was skipped: its time says nothing of the pace
         rows = db.execute("select planned_min, actual_min, measured from sessions "
                           "where task = ? and status = 'done'", (t["id"],)).fetchall()
         planned = sum(r["planned_min"] for r in rows)
