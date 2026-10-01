@@ -435,7 +435,8 @@ def cycle(db, svc, dry_run: bool, sweep: bool = False) -> None:
                 write_stats(db, nt, cfg, resolved, state)
             except Exception as e:           # the stats page is a report, never a blocker
                 log(f"stats page not updated: {e}")
-    clear_alert(db, svc)
+    if not unplaced:                         # the "do not fit" alert stands until it all fits
+        clear_alert(db, svc)
     set_kv(db, "fingerprint", fp)
     set_kv(db, "resolved", resolved)
     db.commit()
