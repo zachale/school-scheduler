@@ -70,6 +70,20 @@ def subtract(free: list[tuple[int, int]], busy: tuple[int, int]) -> list[tuple[i
 
 
 # ---------- unavailability ---------------------------------------------------
+def day_hours(cfg: dict, date: dt.date) -> dict:
+    """Working hours and daily caps for one date: the usual ones, or those of a stretch
+    under work_hours.stretches that covers it (a crunch week, say). A stretch replaces
+    whichever of core, overflow, max_core_hours and max_total_hours it gives."""
+    w, S = cfg["work_hours"], cfg["sessions"]
+    h = {"core": w["core"], "overflow": w["overflow"],
+         "max_core_hours": S["max_core_hours_per_day"],
+         "max_total_hours": S["max_total_hours_per_day"]}
+    for st in w.get("stretches") or []:
+        if st["from"] <= date <= st["to"]:
+            h.update({k: st[k] for k in h if k in st})
+    return h
+
+
 def blocked_dates(cfg: dict) -> dict[dt.date, str]:
     """Every whole day with no work and no classes, mapped to its reason."""
     out: dict[dt.date, str] = {}
@@ -248,7 +262,7 @@ class Day:
         w = self.cfg["work_hours"]
         if not w.get("include_weekends", True) and self.date.weekday() >= 5:
             return []
-        rng = w["overflow"] if overflow else w["core"]
+        rng = day_hours(self.cfg, self.date)["overflow" if overflow else "core"]
         free = [(max(hm(rng[0]), self.not_before), hm(rng[1]))]
         free = [(a, b) for a, b in free if b > a]
         for b in self.fixed + self.blocks:
@@ -381,7 +395,7 @@ def resolve_windows(cfg: dict, tasks: list[dict], blocked: dict, now: dt.datetim
             d -= dt.timedelta(days=1)
         return d
 
-    end_of_day = hm(cfg["work_hours"]["overflow"][1])
+    end_of_day = hm(day_hours(cfg, today)["overflow"][1])
 
     def soonest_finish(start: dt.date, minutes: int) -> dt.datetime:
         """The earliest a task could be done if begun on `start`, at ~5 h a day. Today
@@ -529,8 +543,6 @@ def schedule(cfg: dict, tasks: list[dict], events: list[dict], busy: list[dict],
         return days
 
     S = cfg["sessions"]
-    core_cap = int(S["max_core_hours_per_day"] * 60)
-    total_cap = int(S["max_total_hours_per_day"] * 60)
     exam_cap = int(S.get("exam_day_max_hours", S["max_total_hours_per_day"]) * 60)
 
     sized_by_task: dict[str, list] = {}
@@ -563,7 +575,9 @@ def schedule(cfg: dict, tasks: list[dict], events: list[dict], busy: list[dict],
         # target below the core cap pushed work into evenings and worsened peak days.)
         for day in days:
             exam_day = any(b.get("cat") == "Exam" for b in day.fixed)
-            passes = [(False, core_cap, False), (True, total_cap, True)]
+            h = day_hours(cfg, day.date)
+            passes = [(False, int(h["max_core_hours"] * 60), False),
+                      (True, int(h["max_total_hours"] * 60), True)]
             for overflow, cap, pressed_only in passes:
                 if exam_day:
                     if overflow:

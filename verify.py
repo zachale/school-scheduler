@@ -45,8 +45,22 @@ fails, oks, warns = [], [], []
 def check(cond, ok_msg, fail_msg=None):
     (oks if cond else fails).append(ok_msg if cond else (fail_msg or ok_msg))
 
-CORE = (hm(cfg["work_hours"]["core"][0]), hm(cfg["work_hours"]["core"][1]))
-OVER = (hm(cfg["work_hours"]["overflow"][0]), hm(cfg["work_hours"]["overflow"][1]))
+
+
+# mirrors plan.py
+def day_hours(cfg: dict, date: dt.date) -> dict:
+    """Working hours and daily caps for one date: the usual ones, or those of a stretch
+    under work_hours.stretches that covers it (a crunch week, say). A stretch replaces
+    whichever of core, overflow, max_core_hours and max_total_hours it gives."""
+    w, S = cfg["work_hours"], cfg["sessions"]
+    h = {"core": w["core"], "overflow": w["overflow"],
+         "max_core_hours": S["max_core_hours_per_day"],
+         "max_total_hours": S["max_total_hours_per_day"]}
+    for st in w.get("stretches") or []:
+        if st["from"] <= date <= st["to"]:
+            h.update({k: st[k] for k in h if k in st})
+    return h
+
 TRAV = cfg["travel"]["minutes_each_way"]
 S = cfg["sessions"]
 EXAM_CAP = S.get("exam_day_max_hours", S["max_total_hours_per_day"]) * 60
@@ -63,6 +77,8 @@ maxday = 0.0
 
 for day in sched:
     date = dt.date.fromisoformat(day["date"])
+    H = day_hours(cfg, date)
+    CORE, OVER = ((hm(H[k][0]), hm(H[k][1])) for k in ("core", "overflow"))
     fixed = [(hm(b["start"]), hm(b["end"]), b) for b in day["fixed"]]
     allwork = [(hm(b["start"]), hm(b["end"]), b) for b in day["work"]]
     for ws, we, wb in allwork:
@@ -185,9 +201,9 @@ for day in sched:
             fails.append(f"{date} no {TRAV} min travel after {ce//60:02d}:{ce%60:02d}")
 
     if any(not b["overflow"] for _, _, b in work) and \
-            sum(e - s for s, e, b in allwork if not b["overflow"]) > S["max_core_hours_per_day"] * 60 + 1:
+            sum(e - s for s, e, b in allwork if not b["overflow"]) > H["max_core_hours"] * 60 + 1:
         fails.append(f"{date} core cap exceeded")
-    if work and wmin > S["max_total_hours_per_day"] * 60 + 1:
+    if work and wmin > H["max_total_hours"] * 60 + 1:
         fails.append(f"{date} total cap exceeded: {wmin/60:.1f} h")
 
 # every task's remaining minutes fully scheduled
