@@ -158,6 +158,20 @@ def notion_on() -> bool:
     return notion.TOKEN_FILE.expanduser().exists()
 
 
+def mark_missed(db, clock: dt.datetime, grace: dt.timedelta, commit: bool = True) -> int:
+    """A block still unticked `grace` after it ended was missed, the same day: its time is
+    planned again right away instead of at the day turnover. A tick that comes later
+    still counts, and gives the replanned time back (notion_sync's late-tick path)."""
+    cut = clock - grace
+    n = db.execute("update sessions set status = 'missed' where status = 'planned' and "
+                   "(date < ? or (date = ? and \"end\" <= ?))",
+                   (str(cut.date()), str(cut.date()), f"{cut:%H:%M}")).rowcount
+    if n and commit:
+        db.commit()
+        log(f"{n} block{'s' if n != 1 else ''} ended unticked: missed, planned again")
+    return n
+
+
 def rollover(db, now: dt.datetime, commit: bool = True) -> bool:
     """Once the day turns, the blocks left unchecked on earlier days become history:
     missed, with their minutes planned again. Without Notion there is no done signal,
@@ -394,10 +408,14 @@ def cycle(db, svc, dry_run: bool, sweep: bool = False) -> None:
     nt = notion.Notion(cfg["notion"]["data_source"]) if notion_on() else None
     if nt:
         notion_sync.read(db, nt, cfg, clock)
+        # after the ticks are read, so a block ticked within its grace is done, not missed
+        missed = mark_missed(db, clock, dt.timedelta(minutes=cfg["notion"].get("grace_minutes", 15)),
+                             commit=not dry_run)
     # after the ticks are read: a block ticked before the day turned is done, not missed,
     # and a block's tick is never read as a task's last while an earlier one is still
     # waiting to become missed (and be planned again)
-    forced = rollover(db, now, commit=not dry_run)
+    # a block that turned missed is not in the fingerprint (it was history, now it is owed)
+    forced = rollover(db, now, commit=not dry_run) or bool(nt and missed)
     state = planner_state(db, now)
     fp = fingerprint(busy, state)
     if fp == kv(db, "fingerprint") and not (forced or sweep or dry_run):

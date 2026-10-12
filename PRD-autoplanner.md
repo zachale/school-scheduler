@@ -98,8 +98,10 @@ never writes to a session row between its start and the end of its grace window.
 | Later the same day | `Actual min` if filled, else planned minutes | unchanged |
 | Before the block starts | `Actual min` if filled, else planned minutes | removed; the slot is freed |
 
-- **Missed:** at the 00:05 rollover, an unchecked block from the previous day is set to
-  Missed. It stays on its slot, and its minutes go to new session rows. Checking a Missed row
+- **Missed:** an unchecked block is set to Missed once its grace window (15 min) after it
+  ends has passed, and the next replan gives its time to new sessions the same day
+  (revised 2026-10-12: it used to wait for the 00:05 rollover, so a block skipped in the
+  morning still counted as done until midnight). It stays on its slot, and its minutes go to new session rows. Checking a Missed row
   later counts it as done late and cancels that many replacement minutes.
 - **Submitting mid-session:** checking a deliverable row while one of its sessions is
   running first closes that session at the check time.
