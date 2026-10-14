@@ -461,13 +461,17 @@ def write(db, nt: notion.Notion, cfg: dict, resolved: list[dict], now: dt.dateti
     # a missed block's time is already planned again, so its row leaves the calendar (no
     # date) but stays in Could Do marked Missed: ticked late, it still counts, and the done
     # loop below puts it back on its slot
-    for s in db.execute("select id from sessions where status = 'missed'"):
+    # (a skipped or dropped block leaves it the same way, keeping its Skip box as the record)
+    for s in db.execute("select id, status from sessions where status in ('missed', 'skipped', 'dropped')"):
         row = known.get(f"session:{s['id']}")
-        if row and (row["state"] != "Missed" or row["w_start"] is not None):
-            nt.update(row["page_id"], {"Plan state": {"select": {"name": "Missed"}},
-                                       "Due Date": {"date": None}})
-            db.execute("update rows set state = 'Missed', w_start = null, w_end = null "
-                       "where plan_id = ?", (f"session:{s['id']}",))
+        missed = s["status"] == "missed"
+        if row and ((missed and row["state"] != "Missed") or row["w_start"] is not None):
+            props = {"Due Date": {"date": None}}
+            if missed:
+                props["Plan state"] = {"select": {"name": "Missed"}}
+            nt.update(row["page_id"], props)
+            db.execute("update rows set state = coalesce(?, state), w_start = null, w_end = null "
+                       "where plan_id = ?", ("Missed" if missed else None, f"session:{s['id']}"))
             db.commit()
             updated += 1
 
