@@ -101,7 +101,9 @@ never writes to a session row between its start and the end of its grace window.
 - **Missed:** an unchecked block is set to Missed once its grace window (15 min) after it
   ends has passed, and the next replan gives its time to new sessions the same day
   (revised 2026-10-12: it used to wait for the 00:05 rollover, so a block skipped in the
-  morning still counted as done until midnight). It stays on its slot, and its minutes go to new session rows. Checking a Missed row
+  morning still counted as done until midnight). Since 2026-10-13 a missed block's row
+  loses its date, so it leaves the calendar once its time has gone to new sessions; it
+  stays in Could Do marked Missed, and a late check puts it back on its slot as done. It stays on its slot, and its minutes go to new session rows. Checking a Missed row
   later counts it as done late and cancels that many replacement minutes.
 - **Submitting mid-session:** checking a deliverable row while one of its sessions is
   running first closes that session at the check time.

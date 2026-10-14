@@ -57,7 +57,7 @@ def read(db, nt: notion.Notion, cfg: dict, now: dt.datetime) -> None:
         raise notion.NotionError(f"{len(gone)} of {len(known)} planner rows vanished from Could "
                                  "Do at once; not treating that as deletions")
 
-    imported = set()
+    imported, undated = set(), set()
     for plan_id, row in rows.items():
         kind, _, ident = plan_id.partition(":")
         if kind not in ("deadline", "session"):
@@ -76,6 +76,8 @@ def read(db, nt: notion.Notion, cfg: dict, now: dt.datetime) -> None:
         if kind == "session":
             if db.execute("select 1 from sessions where id = ?", (ident,)).fetchone() is None:
                 imported.add(ident.rpartition("#")[0])
+                if not row["start"]:
+                    undated.add(ident.rpartition("#")[0])
             _session_change(db, row, ident, was_done, now, grace, bot, before)
             if row["state"] == "Missed":
                 db.execute("update sessions set status = 'missed' where id = ? "
@@ -91,7 +93,7 @@ def read(db, nt: notion.Notion, cfg: dict, now: dt.datetime) -> None:
             _skip_change(db, kind, ident, row, now)
         db.execute("update rows set done = ?, skip = ? where plan_id = ?",
                    (int(row["done"]), int(row["skip"]), plan_id))
-    for task in imported:
+    for task in imported - undated:
         _refinish_rebuilt(db, task)
 
     for plan_id in gone:                      # confirm each one is really in the trash
@@ -456,12 +458,16 @@ def write(db, nt: notion.Notion, cfg: dict, resolved: list[dict], now: dt.dateti
             remember(plan_id, row["page_id"], props, times)
             updated += 1
 
-    # a block left unchecked when its day ended stays on its slot, marked Missed
+    # a missed block's time is already planned again, so its row leaves the calendar (no
+    # date) but stays in Could Do marked Missed: ticked late, it still counts, and the done
+    # loop below puts it back on its slot
     for s in db.execute("select id from sessions where status = 'missed'"):
         row = known.get(f"session:{s['id']}")
-        if row and row["state"] != "Missed":
-            nt.update(row["page_id"], {"Plan state": {"select": {"name": "Missed"}}})
-            db.execute("update rows set state = 'Missed' where plan_id = ?", (f"session:{s['id']}",))
+        if row and (row["state"] != "Missed" or row["w_start"] is not None):
+            nt.update(row["page_id"], {"Plan state": {"select": {"name": "Missed"}},
+                                       "Due Date": {"date": None}})
+            db.execute("update rows set state = 'Missed', w_start = null, w_end = null "
+                       "where plan_id = ?", (f"session:{s['id']}",))
             db.commit()
             updated += 1
 
