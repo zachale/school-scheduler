@@ -399,9 +399,9 @@ def resolve_windows(cfg: dict, tasks: list[dict], blocked: dict, now: dt.datetim
 
     def soonest_finish(start: dt.date, minutes: int) -> dt.datetime:
         """The earliest a task could be done if begun on `start`, at ~5 h a day. Today
-        counts only the hours that are actually left."""
+        counts only the hours that are actually left, and none if today is blocked."""
         d, left = start, minutes
-        if d == today:
+        if d == today and avail(d):
             hours_left = max(0, end_of_day - (now.hour * 60 + now.minute))
             left -= min(left, hours_left)
             if left <= 0:
