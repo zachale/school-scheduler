@@ -350,8 +350,11 @@ def apply_state(tasks: list[dict], state: dict):
     speed = state.get("multiplier") or {}
     today = dt.datetime.fromisoformat(state["now"]).date()
     pinned: dict[str, int] = {}
-    for b in (state.get("pinned") or []) + (state.get("locked") or []):
+    placed: dict[str, set[dt.date]] = {}
+    for b, day in ([(b, today) for b in state.get("pinned") or []]
+                   + [(b, dt.date.fromisoformat(b["date"])) for b in state.get("locked") or []]):
         pinned[b["task"]] = pinned.get(b["task"], 0) + hm(b["end"]) - hm(b["start"])
+        placed.setdefault(b["task"], set()).add(day)
     owed, closed = [], []
     for t in tasks:
         t["_base"] = t["minutes"]
@@ -359,6 +362,11 @@ def apply_state(tasks: list[dict], state: dict):
             t["minutes"] = max(5, round(t["minutes"] * speed[t["id"]]))
         t["_done"] = int(done.get(t["id"], 0))
         t["_pinned"] = pinned.get(t["id"], 0)
+        # the days its blocks already sit on: under way today or moved by Zach, and with
+        # the latest day it was worked on, every day it already has time on
+        t["_placed_on"] = sorted(placed.get(t["id"], ()))
+        t["_days"] = sorted(set(t["_placed_on"])
+                            | ({dt.date.fromisoformat(last[t["id"]])} if t["id"] in last else set()))
         left = t["minutes"] - t["_done"] - t["_pinned"]
         status = None
         if t["id"] in dropped_ids:
@@ -376,8 +384,7 @@ def apply_state(tasks: list[dict], state: dict):
                 t["_wrapup"] = True
         if status:
             t["_status"] = status
-            t["_finished_on"] = (today if t["_pinned"]
-                                 else dt.date.fromisoformat(last.get(t["id"], str(today))))
+            t["_finished_on"] = t["_days"][-1] if t["_days"] else today
             closed.append(t)
         else:
             owed.append(t)
@@ -385,9 +392,10 @@ def apply_state(tasks: list[dict], state: dict):
 
 
 def resolve_windows(cfg: dict, tasks: list[dict], blocked: dict, now: dt.datetime,
-                    late_ok: set[str], seeded: dict[str, list[dt.date]]):
+                    late_ok: set[str], anchors: dict[str, list[tuple[str, dt.date]]]):
     """Resolve each task's real window against the days actually available and the
-    current time. Returns the tasks to schedule, the overdue tasks left unscheduled,
+    current time. `anchors` holds, per spread group, the (post, day) pairs its posts
+    already sit on. Returns the tasks to schedule, the overdue tasks left unscheduled,
     and a human-readable list of what changed."""
     changes: list[str] = []
     avail = lambda d: d not in blocked
@@ -478,7 +486,10 @@ def resolve_windows(cfg: dict, tasks: list[dict], blocked: dict, now: dt.datetim
                 t["_due"] = new
             t["_buffer_days"] = (t["_orig_due"].date() - t["_due"].date()).days
 
-    # spread groups: split each group evenly across its available days
+    # spread groups: split each group's posts evenly across the days still open to them:
+    # available, and min_gap_days from every day a post of the group already sits on
+    # (finished, done, under way or moved by Zach). A post with a block already placed
+    # finishes on that block's day.
     groups: dict[str, list[dict]] = {}
     for t in live:
         if t.get("spread_group"):
@@ -487,20 +498,34 @@ def resolve_windows(cfg: dict, tasks: list[dict], blocked: dict, now: dt.datetim
         members.sort(key=lambda t: t["id"])
         gap = max((t.get("min_gap_days", 1) for t in members), default=1)
         lo = max(min(t["_earliest"] for t in members), today)
-        if seeded.get(gid):          # posts already done hold the next one back
-            lo = max(lo, max(seeded[gid]) + dt.timedelta(days=gap))
         hi = max(t["_due"] for t in members)
+        free = []
+        for t in members:
+            t["_group_window"] = (lo, hi)        # its fallback if its share has no room
+            d = max(t["_placed_on"], default=None)
+            if d and lo <= d <= hi.date() and avail(d):
+                t["_earliest"], t["_due"] = d, by_evening(d, hi)
+            else:
+                free.append(t)
+        # the posts still to place share out what the others leave; among themselves the
+        # spacing is kept as they are placed, so a post's own earlier day never shifts it
+        placing = {t["id"] for t in free}
+        taken = [d for p, d in anchors.get(gid, []) if p not in placing]
         days = [lo + dt.timedelta(days=i) for i in range((hi.date() - lo).days + 1)]
-        days = [d for d in days if avail(d)]
-        n = len(members)
+        days = [d for d in days if avail(d) and all(abs((d - a).days) >= gap for a in taken)]
+        n = len(free)
         if not days:
             continue
-        for j, t in enumerate(members):
+        for j, t in enumerate(free):
             a = days[min(len(days) - 1, (j * len(days)) // n)]
             b = days[min(len(days) - 1, ((j + 1) * len(days)) // n - 1)]
-            t["_earliest"] = a
-            t["_due"] = hi if j == n - 1 else dt.datetime.combine(b, dt.time(22, 0))
+            t["_earliest"], t["_due"] = a, by_evening(b, hi)
     return live, overdue, changes
+
+
+def by_evening(d: dt.date, due: dt.datetime) -> dt.datetime:
+    """Finish on day d: by 22:00, or by the real due time on the due date itself."""
+    return due if d == due.date() else dt.datetime.combine(d, dt.time(22, 0))
 
 
 # ---------- scheduler --------------------------------------------------------
@@ -513,12 +538,18 @@ def schedule(cfg: dict, tasks: list[dict], events: list[dict], busy: list[dict],
     parse_tasks(tasks)
     changes = add_catchups(cfg, tasks, blocked)
     tasks, finished = apply_state(tasks, state)
-    seeded: dict[str, list[dt.date]] = {}
+    # the days each spread group's posts already sit on hold the group's other posts
+    # min_gap_days away: finished posts, and the blocks done, under way or moved by Zach
+    anchors: dict[str, list[tuple[str, dt.date]]] = {}
+    for t in tasks:
+        if t.get("spread_group"):
+            anchors.setdefault(t["spread_group"], []).extend((t["id"], d) for d in t["_days"])
     for t in finished:               # a post that was dropped never happened
         if t.get("spread_group") and t["_status"] == "finished":
-            seeded.setdefault(t["spread_group"], []).append(t["_finished_on"])
+            anchors.setdefault(t["spread_group"], []).extend(
+                (t["id"], d) for d in t["_days"] or [t["_finished_on"]])
     live, overdue, more = resolve_windows(cfg, tasks, blocked, now,
-                                          set(state.get("late_ok") or []), seeded)
+                                          set(state.get("late_ok") or []), anchors)
     changes += more
     tasks = live
     def build_days():
@@ -569,8 +600,8 @@ def schedule(cfg: dict, tasks: list[dict], events: list[dict], busy: list[dict],
             return d
 
         unplaced: list[dict] = []
-        # discussion posts already finished still count toward the spacing rule
-        group_days: dict[str, list[dt.date]] = {k: list(v) for k, v in seeded.items()}
+        # every day a post of the group sits on holds the group's other posts back
+        group_days = {k: list(v) for k, v in anchors.items()}
 
         # Per day, two passes: core hours with any live task, then evening overflow
         # for pressed work only. An exam day is capped lower and never runs into the
@@ -600,7 +631,7 @@ def schedule(cfg: dict, tasks: list[dict], events: list[dict], busy: list[dict],
                             return True
                         gap = t.get("min_gap_days", 1)
                         return all(abs((day.date - d).days) >= gap
-                                   for d in group_days.get(gid, []))
+                                   for post, d in group_days.get(gid, []) if post != t["id"])
 
                     live = [t for t in tasks
                             if t["remaining"] > 0
@@ -660,8 +691,9 @@ def schedule(cfg: dict, tasks: list[dict], events: list[dict], busy: list[dict],
                             if sid:
                                 t["_sizes"].pop(0)
                             t["remaining"] -= chunk
-                            if t.get("spread_group") and t["remaining"] == 0:
-                                group_days.setdefault(t["spread_group"], []).append(day.date)
+                            if t.get("spread_group"):
+                                group_days.setdefault(t["spread_group"], []).append(
+                                    (t["id"], day.date))
                             placed = True
                             break
                         if placed:
@@ -698,18 +730,32 @@ def schedule(cfg: dict, tasks: list[dict], events: list[dict], busy: list[dict],
 
     days = build_days()
     unplaced = drop_unplaceable_wrapups(attempt(days))
-    if unplaced:
-        # an early-finish target that cannot be met is a preference, not a deadline
+    # what does not fit gives up its preferences first, keeping every rule. A round only
+    # ever widens a window, and only to a fixed bound, so this ends
+    while unplaced:
         relaxed = False
         for t in unplaced:
+            # an early-finish target that cannot be met is a preference, not a deadline
             if t.get("_hard_due") and t["_hard_due"] > t["_due"]:
                 changes.append(f"{t['course']} {t['title']}: cannot finish "
                                f"{t['_buffer_days']} days early, using its real deadline")
                 # the early-finish promise is released for this one: verify expects no buffer
                 t["_due"], t["_buffer_days"], relaxed = t["_hard_due"], 0, True
-        if relaxed:
-            days = build_days()
-            unplaced = drop_unplaceable_wrapups(attempt(days))
+            # a post with no room in its share of its group's days may take any day of the
+            # group's window that still keeps min_gap_days from the others
+            if t.get("_group_window"):
+                lo, hi = t["_group_window"]
+                wide = (min(t["_earliest"], lo), max(t["_due"], hi))
+                if wide != (t["_earliest"], t["_due"]):
+                    t["_earliest"], t["_due"] = wide
+                    changes.append(f"{t['course']} {t['title']}: no room in its share of the "
+                                   f"group's days, so any day {wide[0]:%b %d}-{wide[1]:%b %d} "
+                                   "that keeps the spacing")
+                    relaxed = True
+        if not relaxed:
+            break
+        days = build_days()
+        unplaced = drop_unplaceable_wrapups(attempt(days))
     if unplaced:
         # last resort: give back the learned speed and the post spacing rather than
         # leave work unscheduled and the whole plan frozen
@@ -926,7 +972,8 @@ def main() -> None:
         "done": t["_done"], "owed": t["minutes"] - t["_done"],
         "status": status, "late": bool(t.get("_overdue")), "earliest": str(t["_earliest"]),
         "due": f"{t['_due']:%Y-%m-%d %H:%M}", "orig_due": f"{t['_orig_due']:%Y-%m-%d %H:%M}",
-        "spread_group": t.get("spread_group"), "note": t.get("note", ""),
+        "spread_group": t.get("spread_group"), "min_gap_days": t.get("min_gap_days"),
+        "note": t.get("note", ""),
         "buffer_days": t.get("_buffer_days"),
         "finished_on": str(t["_finished_on"]) if "_finished_on" in t else None,
     }

@@ -13,7 +13,7 @@ exception. Blocks already started, and blocks Zach moved himself ("pinned"; move
 are also "locked"), are his: they count toward totals and caps, but are not re-judged.
 A block he resized ("sized") keeps whatever length he gave it.
 """
-import datetime as dt, json, sys
+import datetime as dt, itertools, json, sys
 from collections import defaultdict
 from pathlib import Path
 import yaml
@@ -25,7 +25,8 @@ resolved = json.loads((HERE / "resolved_tasks.json").read_text())
 tasks = {t["id"]: t for t in resolved if t["status"] in ("scheduled", "unplaced")}
 sched = json.loads((HERE / "schedule.json").read_text())
 busy = json.loads((HERE / "busy.json").read_text())["busy"]
-NOW = dt.datetime.fromisoformat(json.loads((HERE / "state.json").read_text())["now"])
+STATE = json.loads((HERE / "state.json").read_text())
+NOW = dt.datetime.fromisoformat(STATE["now"])
 hm = lambda s: int(s[:2]) * 60 + int(s[3:])
 dtm = lambda s: dt.datetime.strptime(s, "%Y-%m-%d %H:%M")
 
@@ -222,26 +223,32 @@ for t in resolved:
         warns.append(f"late OK: {t['course']} {t['title']} was due {t['orig_due']}, "
                      f"now finishing by {t['due']}")
 
-# spread groups: separate days, minimum gap
-groups = defaultdict(list)
+# spread groups: every post on days of its own, min_gap_days from each other post of its
+# group. A post's days are those its blocks sit on, under way and moved by Zach included,
+# the day it was last worked on, and for a finished post the day it finished. The planner
+# is judged on the days it chose; two days that are both history or Zach's own placing
+# are his call.
+posts = {t["id"]: t for t in resolved if t["status"] in ("scheduled", "unplaced", "finished")
+         and t.get("spread_group")}
+groups = defaultdict(lambda: defaultdict(set))   # group -> post -> {(day, planner chose it)}
 for day in sched:
     for b in day["work"]:
-        g = tasks[b["task"]].get("spread_group") if b["task"] in tasks else None
-        if g:
-            groups[g].append((dt.date.fromisoformat(day["date"]), True))
-for t in resolved:              # posts already finished still hold the next one back
-    if t["status"] == "finished" and t.get("spread_group"):
-        groups[t["spread_group"]].append((dt.date.fromisoformat(t["finished_on"]), False))
+        if b["task"] in posts:
+            groups[posts[b["task"]]["spread_group"]][b["task"]].add(
+                (dt.date.fromisoformat(day["date"]), not b.get("pinned")))
+last_done = STATE.get("last_done") or {}
+for t in posts.values():
+    if t["id"] in last_done:
+        groups[t["spread_group"]][t["id"]].add((dt.date.fromisoformat(last_done[t["id"]]), False))
+    if t["status"] == "finished":
+        groups[t["spread_group"]][t["id"]].add((dt.date.fromisoformat(t["finished_on"]), False))
 bad_spread = []
-for g, ds in sorted(groups.items()):
-    u = sorted(set(ds))
-    planned = [d for d, live in u if live]
-    if len(planned) != len({d for d, live in u if live}):
-        bad_spread.append(f"{g}: two posts planned for the same day")
-    for (a, la), (b, lb) in zip(u, u[1:]):
-        if (b - a).days < 2 and (la or lb):       # a pair of finished posts is history
-            bad_spread.append(f"{g}: posts closer than 2 days "
-                              f"({a:%b %d} and {b:%b %d})")
+for g, members in sorted(groups.items()):
+    gap = max(posts[p].get("min_gap_days") or 1 for p in members)
+    for p, q in itertools.combinations(sorted(members), 2):
+        for (a, pa), (b, pb) in itertools.product(sorted(members[p]), sorted(members[q])):
+            if abs((a - b).days) < gap and (pa or pb):
+                bad_spread.append(f"{g}: {p} {a:%b %d} and {q} {b:%b %d} closer than {gap} days")
 fails += bad_spread
 
 # catch-up exists for every course that lost a lecture to a write-off, when catch-up is on
@@ -270,7 +277,8 @@ check(not any("write-off" in f for f in fails),
 check(not any("exam day" in f for f in fails),
       f"{n['exam']} exam days capped at {EXAM_CAP/60:.0f} h with no evening work")
 check(not any("travel" in f for f in fails), "travel brackets every class and exam trip")
-check(not bad_spread, f"discussion posts on separate days, >=2 days apart ({len(groups)} groups)")
+check(not bad_spread, f"discussion posts on separate days, >= min_gap_days apart, moved ones "
+                      f"included ({len(groups)} groups)")
 check(missed <= have_cu, f"catch-up generated for every course that missed lectures ({', '.join(sorted(missed)) or 'none'})",
       f"missing catch-up for {sorted(missed - have_cu)}")
 check(not any("cap exceeded" in f for f in fails), f"daily caps held (busiest {maxday:.1f} h)")
