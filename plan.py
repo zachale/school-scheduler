@@ -296,12 +296,15 @@ def parse_tasks(tasks: list[dict]) -> None:
 
 
 def add_catchups(cfg: dict, tasks: list[dict], blocked: dict) -> list[str]:
-    """Missed lectures become catch-up work, replacing that week's review. Runs on the
+    """Missed lectures become catch-up work, replacing that week's review, when config has
+    a `catchup` section; without one, missed lectures generate nothing. Runs on the
     tasks.yaml windows, before progress or overdue handling can move them."""
     changes: list[str] = []
+    if not cfg.get("catchup"):
+        return changes
     avail = lambda d: d not in blocked
-    per = cfg.get("catchup", {}).get("minutes_per_missed_lecture", 117)
-    span = cfg.get("catchup", {}).get("days_to_complete", 7)
+    per = cfg["catchup"]["minutes_per_missed_lecture"]
+    span = cfg["catchup"]["days_to_complete"]
     for course, dates in missed_lectures(cfg, blocked).items():
         back = max(dates) + dt.timedelta(days=1)
         while not avail(back):

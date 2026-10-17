@@ -244,9 +244,9 @@ for g, ds in sorted(groups.items()):
                               f"({a:%b %d} and {b:%b %d})")
 fails += bad_spread
 
-# catch-up exists for every course that lost a lecture to a write-off
+# catch-up exists for every course that lost a lecture to a write-off, when catch-up is on
 missed = set()
-for d in blocked:
+for d in blocked if cfg.get("catchup") else []:
     wd = d.weekday()
     if any(o["date"] == d for o in cfg.get("no_class_days") or []):
         continue
